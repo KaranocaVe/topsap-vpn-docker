@@ -167,6 +167,9 @@ def fetch_package_once(url, output, expected=None):
         deadline = time.monotonic() + 15 * 60
         with open_url(url) as response, tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
             temporary = Path(stream.name)
+            if (getattr(response, 'status', 200) != 200
+                    or (hasattr(response, 'headers') and response.headers.get('Content-Range'))):
+                raise HTTPException('Expected a complete HTTP 200 package response')
             length = response.headers.get('Content-Length') if hasattr(response, 'headers') else None
             while True:
                 block = response.read(1024 * 1024)

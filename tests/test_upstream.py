@@ -85,6 +85,17 @@ class UpstreamTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_update_rejects_partial_http_response_without_a_pinned_hash(self):
+        class Partial(io.BytesIO):
+            status = 206
+            headers = {'Content-Length': '7', 'Content-Range': 'bytes 0-6/100'}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'package.deb'
+            with patch.object(upstream, 'open_url', side_effect=lambda _: Partial(b'partial')):
+                with self.assertRaises(upstream.HTTPException):
+                    upstream.fetch_package(upstream.SOURCE + 'package.deb', target)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_interrupted_download_retries_and_cleans_partial_file(self):
         class Broken(io.BytesIO):
             headers = {'Content-Length': '100'}
