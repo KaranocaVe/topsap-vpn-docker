@@ -82,3 +82,29 @@ class UpstreamTests(unittest.TestCase):
             lock.write_text(json.dumps(data))
             with self.assertRaises(ValueError):
                 upstream.read_lock(lock)
+
+
+class TransportTests(unittest.TestCase):
+    def test_interrupted_download_retries_and_cleans_partial_file(self):
+        class Broken(io.BytesIO):
+            headers = {'Content-Length': '100'}
+        payload = b'complete'
+        expected = {'sha256': hashlib.sha256(payload).hexdigest(), 'size': len(payload)}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'package.deb'
+            target.write_bytes(b'previous')
+            with patch.object(upstream, 'open_url', side_effect=[Broken(b'partial'), io.BytesIO(payload)]):
+                upstream.fetch_package(upstream.SOURCE + 'package.deb', target, expected)
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(list(Path(directory).iterdir()), [target])
+
+    def test_proxy_candidates_exclude_private_and_authenticated_endpoints(self):
+        import public_proxy
+        raw = b'http://127.0.0.1:80
+http://10.0.0.1:80
+http://user:pass@8.8.8.8:80
+http://8.8.8.8:8080
+file:///tmp/x
+'
+        with patch.object(public_proxy, 'urlopen', side_effect=[OSError(), io.BytesIO(raw)]):
+            self.assertEqual(public_proxy.candidates(), ['http://8.8.8.8:8080'])

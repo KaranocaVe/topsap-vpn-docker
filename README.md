@@ -145,6 +145,15 @@ python3 manage.py build
 
 `update` 会重新读取官网目录、分别下载并计算 `amd64`/`arm64` 的 SHA256；拒绝版本回退，并省略时间戳以避免无内容变化的每日提交。锁文件应和源码一起审阅。
 
+GitHub Actions 在直连官网超时后，会从 GeoNode 和 Proxifly 的公开中国代理列表中筛选 HTTP CONNECT 出口。所有官网连接仍验证 HTTPS 证书和官方域名，锁定构建仍逐字节校验 SHA256；代理不进入运行镜像，也不接触用户的 VPN、SSH 或 TOTP 凭证。下载中断或哈希不符会丢弃临时文件并切换出口，全部失败则终止任务。公开代理随时可能失效，流程无法保证每日都能取得可用出口。
+
+本地构建默认直连；需要相同备用机制时可运行：
+
+```sh
+docker build --build-arg TOPSAP_PUBLIC_PROXY=1 -t topsap-vpn:local .
+python3 scripts/upstream.py update --public-proxy
+```
+
 GitHub Actions 的边界如下：
 
 - 定时上游任务检测官网更新；锁文件变化时自动提交，并调用发布流程。

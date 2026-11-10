@@ -41,6 +41,10 @@ PROXY_OPENERS = None
 PROXY_INDEX = 0
 
 
+class PackageMismatch(ValueError):
+    pass
+
+
 def network_openers():
     global PROXY_OPENERS
     if not PUBLIC_PROXY:
@@ -163,6 +167,7 @@ def fetch_package_once(url, output, expected=None):
         deadline = time.monotonic() + 15 * 60
         with open_url(url) as response, tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
             temporary = Path(stream.name)
+            length = response.headers.get('Content-Length') if hasattr(response, 'headers') else None
             while True:
                 block = response.read(1024 * 1024)
                 if not block:
@@ -174,11 +179,14 @@ def fetch_package_once(url, output, expected=None):
                     raise TimeoutError('Package download exceeded 15 minutes')
                 digest.update(block)
                 stream.write(block)
+        if length is not None and size != int(length):
+            raise OSError('Truncated HTTP package response')
         result = {'sha256': digest.hexdigest(), 'size': size}
         if not size:
             raise ValueError('Empty package download')
         if expected and any(result[key] != expected[key] for key in result):
-            raise ValueError('Downloaded package does not match the committed lock')
+            raise PackageMismatch('Downloaded package does not match the committed lock: '
+                                  + json.dumps(result, sort_keys=True))
         os.replace(temporary, target)
         temporary = None
         return result
@@ -196,6 +204,11 @@ def fetch_package(url, output, expected=None):
                 raise
             rotate_proxy()
             print('Download transport failed; retrying with another available route', flush=True)
+        except PackageMismatch:
+            if not PUBLIC_PROXY or attempt == 2:
+                raise
+            rotate_proxy()
+            print('Incomplete or mismatched package; rejecting it and trying another route', flush=True)
 
 
 def update(path):
