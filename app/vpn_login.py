@@ -164,8 +164,8 @@ def wait_for_tunnel(timeout=900, otp_config=None):
             for link in json.loads(result.stdout):
                 if (link.get("linkinfo", {}).get("info_kind") == "tun"
                         and "UP" in link.get("flags", [])):
-                    # Larger packets stalled SSH key exchange on this VPN path.
-                    # Keep modern SSH defaults and use a conservative tunnel MTU.
+                    # Larger packets stalled connections on this VPN path.
+                    # Use a conservative tunnel MTU to avoid fragmentation issues.
                     subprocess.run(
                         ["ip", "link", "set", "dev", link["ifname"], "mtu", str(settings()['VPN_MTU'])],
                         check=True, capture_output=True, text=True,

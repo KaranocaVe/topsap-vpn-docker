@@ -1,6 +1,6 @@
 # TopSAP VPN Docker
 
-用 Docker 封装 TopSAP Linux 客户端，将 VPN 连接和 SOCKS5 代理限制在容器内。本机继续使用自己的 SSH、密钥、`known_hosts` 和编辑器；本机只看到回环地址上的代理端口。
+用 Docker 封装 TopSAP Linux 客户端，将 VPN 连接和 SOCKS5 代理限制在容器内。本机只看到回环地址上的 SOCKS5 代理端口，其他应用可按需使用该代理访问 VPN 内网。
 
 项目地址：[`KaranocaVe/topsap-vpn-docker`](https://github.com/KaranocaVe/topsap-vpn-docker)
 
@@ -13,10 +13,10 @@
 ## 工作方式
 
 ```text
-本机 ssh / scp / sftp
-        │ 生成的 SSH ProxyCommand
+本机应用（curl、浏览器、客户端）
+        │ SOCKS5
         ▼
-127.0.0.1:1080 → MicroSocks（UID 65534）→ tun0 → 内网目标
+127.0.0.1:1080 → MicroSocks（UID 65534）→ tun0 → 内网 TCP 目标
                                       │
                                       └─ supervisor → TopSAP 后端、Xvfb/Electron、VPN 登录和 TOTP
 ```
@@ -36,15 +36,13 @@ git clone https://github.com/KaranocaVe/topsap-vpn-docker.git
 cd topsap-vpn-docker
 cp .env.example .env
 chmod 600 .env
-# 编辑 .env，至少填写 VPN_HOST、VPN_ACCOUNT、VPN_PASSWD、VPN_TOTP_SECRET、VPN_DNS
+# 编辑 .env，至少填写 VPN_HOST、VPN_ACCOUNT、VPN_PASSWD、VPN_TOTP_SECRET、VPN_DNS、HEALTHCHECK_HOST、HEALTHCHECK_PORT
 $EDITOR .env
 
 ./start.sh                         # 使用 GHCR latest；创建 resolver 并等待 healthy
-python3 manage.py ssh-config --install
-ssh topsap-ssh
 ```
 
-示例配置使用 `vpn.example.com`；SSH 和 health target 示例为 `10.0.0.10`，DNS 示例与 `.env.example` 保持为 `10.0.0.53`。这些值都必须替换成管理员提供且经 VPN 可达的值。`VPN_TOTP_SECRET` 是已绑定认证器的 Base32 密钥；实现固定使用 SHA1、6 位、30 秒周期。`.env` 是数据文件，不会被 shell `source`，不支持变量插值或命令执行；不要提交真实 `.env`。
+示例配置使用 `vpn.example.com`；健康检查目标必须替换成管理员提供且经 VPN 可达的 TCP 主机和端口，其中 `HEALTHCHECK_HOST` 使用目标 IP，`HEALTHCHECK_PORT` 使用目标 TCP 端口。DNS 示例与 `.env.example` 保持为 `10.0.0.53`。这些值都必须替换成适合当前网络的值。`VPN_TOTP_SECRET` 是已绑定认证器的 Base32 密钥；实现固定使用 SHA1、6 位、30 秒周期。`.env` 是数据文件，不会被 shell `source`，不支持变量插值或命令执行；不要提交真实 `.env`。
 
 启动前 `start.sh` 会创建 `runtime/resolv.conf`。服务启动后会等待 Docker healthcheck 通过；若超时，先看日志：
 
@@ -53,6 +51,14 @@ python3 manage.py status
 python3 manage.py check       # 检查 TUN 路由和经 SOCKS 到 HEALTHCHECK_HOST 的实际连接
 python3 manage.py logs
 ```
+
+服务 healthy 后，可直接让支持 SOCKS5 的客户端使用回环端口。例如：
+
+```sh
+curl --socks5-hostname 127.0.0.1:1080 https://target.example/
+```
+
+将 `target.example` 换成经 VPN 可达的目标；`--socks5-hostname` 会让目标域名通过 SOCKS5 解析。
 
 本地源码构建：
 
@@ -73,14 +79,11 @@ python3 manage.py build
 | `VPN_ACCOUNT` / `VPN_PASSWD` | — | VPN 账户和密码，只经 Docker secret 文件传入容器。 |
 | `VPN_TOTP_SECRET` | — | Base32 TOTP 密钥；SHA1、6 位、30 秒。 |
 | `VPN_DNS` | `10.0.0.53` | 运行期 DNS，必须能经 TUN 到达；不会回退到 Docker DNS 或公网 DNS。启动阶段解析网关时才使用 Docker bootstrap DNS。 |
-| `VPN_MTU` | `1280` | TUN MTU，允许范围 1280–1500；链路较敏感时保守 MTU 可避免 SSH 密钥交换停滞。 |
+| `VPN_MTU` | `1280` | TUN MTU，允许范围 1280–1500；链路较敏感时可使用更保守的 MTU。 |
 | `LOGIN_TIMEOUT` | `120` | 单次登录等待隧道的秒数。 |
 | `LOGIN_FAILURE_LIMIT` | `3` | 连续登录失败（含页面、网络和隧道超时）后停止尝试并进入 `needs_attention`。 |
 | `SOCKS_PORT` | `1080` | 仅绑定宿主机 `127.0.0.1`。 |
-| `HEALTHCHECK_HOST` / `HEALTHCHECK_PORT` | `10.0.0.10` / `22` | 必须经 VPN 到达的探测目标；端口 22 还检查 SSH banner。 |
-| `SSH_ALIAS` | `topsap-ssh` | 生成的 SSH Host 别名。 |
-| `SSH_HOST` / `SSH_PORT` / `SSH_ACCOUNT` | `10.0.0.10` / `22` / — | 生成 SSH 配置时使用的目标和账户。 |
-| `SSH_HOST_KEY_POLICY` | `accept-new` | `accept-new` 首次接受并保存新指纹；明确设为 `dynamic` 才会对该 Host 跳过指纹保存和校验。 |
+| `HEALTHCHECK_HOST` / `HEALTHCHECK_PORT` | `10.0.0.10` / `443` | 必须经 VPN 到达的通用 TCP 探测目标；只检查 TCP 连接，不依赖特定协议或服务 banner。将主机替换为管理员提供的目标 IP。 |
 | `DEBUG_DESKTOP` | `0` | 设为 `1` 后临时发布回环地址上的 noVNC `6080`，只用于排障。入口无额外认证，用完改回 `0` 并重启。 |
 
 凭证文件挂载到容器 `/run/secrets/topsap.env`，不写入镜像、Docker 环境变量或进程参数。拥有 Docker 管理权限的宿主用户仍可访问容器数据；请按本机权限模型保护 Docker。
@@ -100,28 +103,21 @@ python3 manage.py build
 | `python3 manage.py status` | 查看容器状态和 health 状态。 |
 | `python3 manage.py logs` | 跟随最近 100 行服务日志，Ctrl-C 退出。 |
 | `python3 manage.py check` | 在容器内验证 TUN 路由和经 SOCKS 到探测目标的实际连接。 |
-| `python3 manage.py ssh-config` | 生成本目录 `ssh_config`；加 `--install` 才会在 `~/.ssh/config` 顶部加入 Include。 |
-| `python3 manage.py ssh -- <ssh 参数>` | 使用生成的配置直接执行 SSH；`ssh.sh` 是同等的快捷入口。 |
 
-`restart: unless-stopped` 只负责 Docker 自身重启后的服务恢复；执行 `down` 或手工停止后不会替你重新启动。
+管理 CLI 仅提供上表中的九个子命令，以及 `--build` 和 `--timeout SECONDS` 选项。`up` 支持附加 `--build` 在启动前构建镜像；需要延长等待时间时可传 `--timeout`。`restart: unless-stopped` 只负责 Docker 自身重启后的服务恢复；执行 `down` 或手工停止后不会替你重新启动。
 
-## 本机 SSH
+## 客户端示例
 
-`ssh-config --install` 只写入一个指向仓库内 `ssh_config` 的 Include，不改动其他 Host 配置。默认生成的 macOS 配置使用系统 `/usr/bin/nc`：
+容器只提供 SOCKS5 代理，不生成客户端配置。需要通过 SSH 访问 VPN 内网目标时，可手工在自己的 `~/.ssh/config` 中加入以下片段：
 
 ```sshconfig
-ProxyCommand /usr/bin/nc -X 5 -x 127.0.0.1:1080 %h %p
+Host vpn-server
+    HostName 10.0.0.10
+    User your-user
+    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
 ```
 
-Linux 的 `nc` 实现不完全相同。请使用支持 SOCKS5 的 netcat，并按该实现的帮助信息为 `ProxyCommand` 写出 SOCKS 选项（常见实现使用 `-x 127.0.0.1:1080`，有的还需要显式 `-X 5` 或 `--proxy-type socks5`）。先用 `nc -h` 确认语法，再执行 `ssh -G topsap-ssh` 检查最终配置。连接没有直连回退，VPN 断开时 SSH 应失败。
-
-默认 `accept-new` 会把首次接收的主机指纹写入本机正常的 `known_hosts`。如果目标是确认过的动态分配机器，可在 `.env` 明确设置：
-
-```dotenv
-SSH_HOST_KEY_POLICY=dynamic
-```
-
-随后运行 `python3 manage.py ssh-config --install`。该 Host 会使用 `StrictHostKeyChecking=no`、`UserKnownHostsFile=/dev/null`、`GlobalKnownHostsFile=/dev/null` 和 `UpdateHostKeys=no`，不保存或校验指纹；这是有意选择的策略，只应在你确认目标身份和网络边界时使用。
+将 `vpn-server`、`10.0.0.10` 和 `your-user` 换成自己的目标与账户后，运行 `ssh vpn-server`。SSH 沿用本机密钥与 `known_hosts`。Linux 和 macOS 的 `nc` 参数可能不同，请先用 `nc -h` 确认本机实现支持 `-X 5` 与 `-x`。
 
 ## 构建、上游锁定与发布
 
@@ -145,7 +141,7 @@ python3 manage.py build
 
 `update` 会重新读取官网目录、分别下载并计算 `amd64`/`arm64` 的 SHA256；拒绝版本回退，并省略时间戳以避免无内容变化的每日提交。锁文件应和源码一起审阅。
 
-GitHub Actions 在直连官网超时后，会从 GeoNode 和 Proxifly 的公开中国代理列表中筛选 HTTP CONNECT 出口。所有官网连接仍验证 HTTPS 证书和官方域名，锁定构建仍逐字节校验 SHA256；代理不进入运行镜像，也不接触用户的 VPN、SSH 或 TOTP 凭证。下载中断或哈希不符会丢弃临时文件并切换出口，全部失败则终止任务。公开代理随时可能失效，流程无法保证每日都能取得可用出口。
+GitHub Actions 在直连官网超时后，会从 GeoNode 和 Proxifly 的公开中国代理列表中筛选 HTTP CONNECT 出口。所有官网连接仍验证 HTTPS 证书和官方域名，锁定构建仍逐字节校验 SHA256；代理不进入运行镜像，也不接触用户的 VPN、TOTP 或其他运行时凭证。下载中断或哈希不符会丢弃临时文件并切换出口，全部失败则终止任务。公开代理随时可能失效，流程无法保证每日都能取得可用出口。
 
 本地构建默认直连；需要相同备用机制时可运行：
 
@@ -168,9 +164,9 @@ GitHub Actions 的边界如下：
 
 1. **启动超时或容器退出**：确认 Docker 正常运行、`.env` 已从示例创建且权限为 `0600`；执行 `python3 manage.py logs`。页面不可用、网络失败和等待 TUN 超时都会计入登录失败次数。
 2. **状态为 `needs_attention`**：修正网关、账户、密码或 TOTP 后执行 `python3 manage.py restart`。达到 `LOGIN_FAILURE_LIMIT` 后服务会停止继续提交错误登录。
-3. **health 不通过**：执行 `python3 manage.py check`。它同时检查目标是否由 TUN 路由，以及 SOCKS 到目标的真实连接；端口 22 还需要收到 SSH banner。确认 `HEALTHCHECK_HOST` 是经 VPN 可达的 IP 和端口。
+3. **health 不通过**：执行 `python3 manage.py check`。它同时检查目标是否由 TUN 路由，以及 SOCKS 到目标的真实 TCP 连接。确认 `HEALTHCHECK_HOST` 和 `HEALTHCHECK_PORT` 是经 VPN 可达的目标与端口。
 4. **IP 可达但域名失败**：检查 `VPN_DNS` 是否是经 TUN 可达的 DNS。运行期不会使用 Docker DNS 或公网 DNS 回退。
-5. **SSH 代理失败**：用 `ssh -G topsap-ssh` 查看 `ProxyCommand`，在 Linux 检查 `nc` 是否支持 SOCKS5 选项；用 `python3 manage.py status` 确认代理已 healthy。
+5. **SOCKS 代理连接失败**：检查客户端是否连接 `127.0.0.1:1080`，并用 `python3 manage.py status` 确认代理已 healthy；支持 SOCKS5 的客户端可用 `curl --socks5-hostname 127.0.0.1:1080 https://target.example/` 验证。
 6. **需要查看桌面**：临时设置 `DEBUG_DESKTOP=1` 并执行 `restart`，访问 `http://127.0.0.1:6080/vnc.html?autoconnect=1`；完成后恢复为 `0` 并再次重启。
 
 提交 Issue 或日志片段前，请删除账户、密码、TOTP、网关凭证、内网地址和主机指纹。

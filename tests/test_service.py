@@ -1,4 +1,5 @@
 import base64
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -10,8 +11,22 @@ import config
 import otp
 import service
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import manage
+
 
 class ServiceTests(unittest.TestCase):
+    def test_service_configuration_requires_only_vpn_and_proxy_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.env').write_text(
+                'VPN_HOST=vpn.example.com:443\nVPN_ACCOUNT=user\nVPN_PASSWD=password\n'
+                'VPN_TOTP_SECRET=TESTSEED\nVPN_DNS=10.0.0.53\nHEALTHCHECK_HOST=10.0.0.10\n')
+            with patch.object(manage, 'ROOT', root), patch.dict(os.environ):
+                values = manage.load()
+            self.assertEqual(values['SOCKS_PORT'], 1080)
+            self.assertEqual(values['HEALTHCHECK_PORT'], 443)
+
     def test_rfc6238_sha1_vectors(self):
         seed = base64.b32encode(b'12345678901234567890').decode()
         vectors = [(59, '94287082'), (1111111109, '07081804'),

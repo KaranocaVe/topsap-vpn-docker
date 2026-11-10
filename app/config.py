@@ -33,7 +33,7 @@ def settings():
             raise ValueError(f'Missing .env setting: {key}')
     for key in ('VPN_DNS', 'HEALTHCHECK_HOST'):
         ipaddress.ip_address(values[key])
-    for key, default, low, high in (('HEALTHCHECK_PORT', '22', 1, 65535),
+    for key, default, low, high in (('HEALTHCHECK_PORT', '443', 1, 65535),
                                    ('VPN_MTU', '1280', 1280, 1500),
                                    ('LOGIN_FAILURE_LIMIT', '3', 1, 10),
                                    ('LOGIN_TIMEOUT', '120', 30, 900)):

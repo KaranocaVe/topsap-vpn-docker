@@ -46,12 +46,6 @@ def probe(host, port, proxy_host='127.0.0.1', proxy_port=1080):
         if size is None:
             size = exact(sock, 1)[0]
         exact(sock, size + 2)
-        if port == 22:
-            banner = b''
-            while b'\n' not in banner and len(banner) < 1024:
-                banner += exact(sock, 1)
-            if not banner.startswith(b'SSH-'):
-                raise ConnectionError('SSH probe did not receive a server banner')
 
 
 def install_firewall():
