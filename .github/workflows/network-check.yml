@@ -1,0 +1,24 @@
+name: Diagnose upstream connectivity
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - name: Check official HTTPS endpoint
+        shell: bash
+        run: |
+          set +e
+          python3 -c 'import socket; print(socket.getaddrinfo("app.topsec.com.cn", 443, type=socket.SOCK_STREAM))'
+          curl -4 -I --connect-timeout 10 --max-time 20 https://app.topsec.com.cn/
+          curl -4 -I --connect-timeout 10 --max-time 20 --resolve app.topsec.com.cn:443:36.112.21.112 https://app.topsec.com.cn/
+          curl -sS --connect-timeout 10 --max-time 20 'https://dns.google/resolve?name=app.topsec.com.cn&type=A'
