@@ -43,7 +43,7 @@ docker build -t topsap-vpn:test . && .github/scripts/smoke-image.sh topsap-vpn:t
 
 - Pull request workflow 只构建 `amd64`/`arm64` 并运行 smoke，不登录 VPN，也不推送镜像。
 - 发布 workflow 在原生 `amd64` 和 `arm64` runner 上构建，分别推送架构 digest，再合并 GHCR manifest。
-- GHCR 标签包括 `latest`、`sha-<完整 commit SHA>` 和 `lock-<packages.lock.json SHA256 前 16 位>`。
+- GHCR 标签包括 `latest`、`<VPN 版本>`、`<VPN 版本>-amd64`、`<VPN 版本>-arm64`、`sha-<完整 commit SHA>` 和 `lock-<packages.lock.json SHA256 前 16 位>`。版本取自锁文件；只有两种架构版本一致时才发布纯版本双架构标签。`latest` 和版本标签仅由当前 `main` 更新。
 - 定时上游 workflow 检查官方目录；锁文件有变化时自动 commit 并调用发布流程。
 - CI 没有 VPN 凭证，因此只验证包、依赖和启动组件，不验证每个使用者的账户、TOTP 或内网目标。
 - 发布完成不会自动更新贡献者或用户的本机 Docker 服务；本机更新仍由用户明确执行 `python3 manage.py update`。锁文件或源码改动需要 `python3 manage.py up --build`。

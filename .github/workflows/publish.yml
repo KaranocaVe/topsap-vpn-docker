@@ -145,6 +145,15 @@ jobs:
           test "${amd64_digest#sha256:}" != "$amd64_digest"
           test "${arm64_digest#sha256:}" != "$arm64_digest"
 
+          read -r amd64_version arm64_version < <(python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts')
+          from upstream import read_lock
+          packages = read_lock('packages.lock.json')['packages']
+          print(packages['amd64']['version'], packages['arm64']['version'])
+          PY
+          )
+
           lockhash="$LOCKHASH_INPUT"
           if [[ -z "$lockhash" && -f packages.lock.json ]]; then
             lockhash=$(sha256sum packages.lock.json | cut -c1-16)
@@ -154,6 +163,11 @@ jobs:
           remote_main=$(git ls-remote origin refs/heads/main | awk '{print $1}')
           if [[ -n "$remote_main" && "$target_sha" == "$remote_main" ]]; then
             tags+=(--tag "$IMAGE:latest")
+            if [[ "$amd64_version" == "$arm64_version" ]]; then
+              tags+=(--tag "$IMAGE:$amd64_version")
+            else
+              echo 'Architecture versions differ; publishing version tags per architecture only.'
+            fi
           fi
           if [[ -n "$lockhash" ]]; then
             tags+=(--tag "$IMAGE:lock-${lockhash}")
@@ -162,4 +176,10 @@ jobs:
             "${tags[@]}" \
             "$IMAGE@${amd64_digest}" \
             "$IMAGE@${arm64_digest}"
+          if [[ -n "$remote_main" && "$target_sha" == "$remote_main" ]]; then
+            docker buildx imagetools create --prefer-index=false \
+              --tag "$IMAGE:${amd64_version}-amd64" "$IMAGE@${amd64_digest}"
+            docker buildx imagetools create --prefer-index=false \
+              --tag "$IMAGE:${arm64_version}-arm64" "$IMAGE@${arm64_digest}"
+          fi
           docker buildx imagetools inspect "$IMAGE:sha-${target_sha}"

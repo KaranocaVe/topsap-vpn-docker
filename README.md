@@ -6,6 +6,14 @@
 
 默认镜像：`ghcr.io/karanocave/topsap-vpn-docker:latest`
 
+按 TopSAP 版本选择镜像，可在 `.env` 中设置：
+
+```dotenv
+TOPSAP_IMAGE='ghcr.io/karanocave/topsap-vpn-docker:3.6.3.32.2.22375'
+```
+
+版本号取自官方客户端包。同一 VPN 版本的包装器修复会更新该标签；需要固定镜像内容时使用完整 commit 标签或 digest。
+
 发布镜像的平台：`linux/amd64`、`linux/arm64`。macOS 和 Windows 使用 Docker Linux VM 运行，不提供原生 macOS/Windows 镜像；当前不支持 `loong64`。
 
 这个仓库是 TopSAP 的容器包装器，不是 TopSAP 官方项目，也不代表 Topsec。包装器源码使用 MIT；TopSAP 客户端及其他第三方组件仍按各自条款使用，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
@@ -154,7 +162,8 @@ GitHub Actions 的边界如下：
 
 - 定时上游任务检测官网更新；锁文件变化时自动提交，并调用发布流程。
 - 发布流程使用原生 `amd64` 与 `arm64` runner 构建，并在没有 VPN 凭证的环境中执行包、依赖和启动组件 smoke；分别推送架构 digest，再合并为 GHCR manifest。
-- GHCR 标签包括 `latest`、`sha-<完整 commit SHA>` 和 `lock-<packages.lock.json SHA256 前 16 位>`；其中 commit 和锁文件标签用于追溯构建输入。
+- GHCR 标签包括 `latest`、`<VPN 版本>`（如 `3.6.3.32.2.22375`）、`<VPN 版本>-amd64`、`<VPN 版本>-arm64`、`sha-<完整 commit SHA>` 和 `lock-<packages.lock.json SHA256 前 16 位>`。
+- 版本来自 `packages.lock.json`。两种架构的 VPN 版本相同时，纯版本标签指向双架构 manifest；不同时只发布各架构自己的版本标签，`latest` 仍支持双架构。`latest` 和版本标签仅由当前 `main` 的构建更新，重建旧 commit 不会覆盖这些标签。
 - Pull request 只构建和 smoke，不推送镜像。
 - CI 验证的是包、依赖和启动组件，不验证任何用户的 VPN 登录、账户、TOTP 或内网目标。
 
