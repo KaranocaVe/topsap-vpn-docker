@@ -100,11 +100,11 @@ class TransportTests(unittest.TestCase):
 
     def test_proxy_candidates_exclude_private_and_authenticated_endpoints(self):
         import public_proxy
-        raw = b'http://127.0.0.1:80
+        raw = b'''http://127.0.0.1:80
 http://10.0.0.1:80
 http://user:pass@8.8.8.8:80
 http://8.8.8.8:8080
 file:///tmp/x
-'
+'''
         with patch.object(public_proxy, 'urlopen', side_effect=[OSError(), io.BytesIO(raw)]):
             self.assertEqual(public_proxy.candidates(), ['http://8.8.8.8:8080'])
