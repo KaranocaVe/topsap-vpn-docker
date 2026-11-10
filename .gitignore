@@ -1,0 +1,11 @@
+.env
+ssh_config
+.env.*.bak
+__pycache__/
+app/__pycache__/
+vendor/*.deb
+runtime/
+verification.json
+*.tar
+*.log
+.DS_Store

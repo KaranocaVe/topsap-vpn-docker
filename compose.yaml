@@ -1,0 +1,47 @@
+name: topsap-vpn
+services:
+  vpn:
+    image: ${TOPSAP_IMAGE:-ghcr.io/karanocave/topsap-vpn-docker:latest}
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, MKNOD, SETUID, SETGID, KILL]
+    device_cgroup_rules: ["c 10:200 rwm"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 2g
+    shm_size: 256m
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,mode=1777
+      - /run:rw,nosuid,nodev,size=32m,mode=755
+      - /opt/apps:rw,exec,nosuid,nodev,size=768m,mode=755
+      - /opt/sslvpn/config:rw,nosuid,nodev,size=32m,mode=700
+    secrets:
+      - source: settings
+        target: topsap.env
+    volumes:
+      - type: bind
+        source: ./runtime/resolv.conf
+        target: /etc/resolv.conf
+        read_only: false
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${SOCKS_PORT:-1080}:1080"
+    healthcheck:
+      test: [CMD, python3, /usr/local/lib/topsap-service/healthcheck.py]
+      interval: 15s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+secrets:
+  settings:
+    file: .env

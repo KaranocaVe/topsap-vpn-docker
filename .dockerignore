@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!app/
+!app/*.py
+!sudo
+!scripts/
+!scripts/upstream.py
+!packages.lock.json

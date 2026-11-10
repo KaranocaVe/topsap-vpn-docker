@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "source": "https://app.topsec.com.cn/",
+  "packages": {
+    "amd64": {
+      "url": "https://app.topsec.com.cn/linux/general/x86_64/deb/TopSAP-3.6.3.32.2.22375_amd64.deb",
+      "version": "3.6.3.32.2.22375",
+      "architecture": "amd64",
+      "sha256": "b80632d99c9ae1a1283a03f0c6379285e652e1aec016788661d4d270eb705ba1",
+      "size": 90044290
+    },
+    "arm64": {
+      "url": "https://app.topsec.com.cn/linux/general/aarch64/TopSAP-3.6.3.32.2.22375_arm64.deb",
+      "version": "3.6.3.32.2.22375",
+      "architecture": "arm64",
+      "sha256": "87d086ed6f79363f0702c792fa6aca8b991d320cdfe9d74fdc71d704a15ed4f6",
+      "size": 102242268
+    }
+  }
+}

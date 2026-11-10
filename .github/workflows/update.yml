@@ -1,0 +1,76 @@
+name: Update upstream package lock
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+concurrency:
+  group: topsap-upstream-update-main
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Refresh packages.lock.json
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: none
+      actions: read
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      sha: ${{ steps.commit.outputs.sha }}
+      lockhash: ${{ steps.commit.outputs.lockhash }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.x'
+      - name: Update upstream lock
+        run: python3 scripts/upstream.py update --output packages.lock.json
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Commit and push changed lock
+        id: commit
+        run: |
+          set -Eeuo pipefail
+          if git diff --quiet -- packages.lock.json; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add packages.lock.json
+          git commit -m 'chore: update upstream package lock'
+          git push origin HEAD:refs/heads/main
+
+          {
+            echo 'changed=true'
+            echo "sha=$(git rev-parse HEAD)"
+            echo "lockhash=$(sha256sum packages.lock.json | cut -c1-16)"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish updated lock
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    uses: ./.github/workflows/publish.yml
+    with:
+      ref: ${{ needs.update.outputs.sha }}
+      lockhash: ${{ needs.update.outputs.lockhash }}
+    permissions:
+      contents: read
+      packages: write
+      actions: read
