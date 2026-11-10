@@ -34,9 +34,9 @@ if not root.is_dir() or not all(path.is_file() for path in entrypoints):
     raise SystemExit("missing vendor runtime entrypoint")
 
 # service.py launches sv_websrv and ele/TopSAP with APP as LD_LIBRARY_PATH.
-# Include Electron's own directory while resolving the same two runtime
-# entrypoints, then walk the vendor libraries reported by ldd.
-environment = dict(os.environ, LD_LIBRARY_PATH=f"{root}:{root / 'ele'}")
+# Match service.py's LD_LIBRARY_PATH exactly, then walk the vendor libraries
+# reported by ldd for both runtime entrypoints.
+environment = dict(os.environ, LD_LIBRARY_PATH=str(root))
 pending = list(entrypoints)
 checked = set()
 while pending:
@@ -82,10 +82,10 @@ PY
   test -S /tmp/.X11-unix/X99
 
   test -x "$vendor_root/ele/TopSAP"
-  DISPLAY=:99 HOME=/tmp/topsap-smoke-home ELECTRON_RUN_AS_NODE=1 \
+  DISPLAY=:99 HOME=/tmp/topsap-smoke-home LD_LIBRARY_PATH="$vendor_root" ELECTRON_RUN_AS_NODE=1 \
     "$vendor_root/ele/TopSAP" --version >/tmp/topsap-electron-version.txt 2>&1
 
-  DISPLAY=:99 HOME=/tmp/topsap-smoke-home LD_LIBRARY_PATH="$vendor_root:$vendor_root/ele" \
+  DISPLAY=:99 HOME=/tmp/topsap-smoke-home LD_LIBRARY_PATH="$vendor_root" \
     "$vendor_root/ele/TopSAP" --no-sandbox --disable-gpu --disable-dev-shm-usage \
     --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
     >/tmp/topsap-electron.log 2>&1 &

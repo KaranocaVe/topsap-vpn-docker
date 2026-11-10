@@ -168,4 +168,4 @@ GitHub Actions 的边界如下：
 
 ## 许可证
 
-仓库包装器源码采用 [MIT License](LICENSE)。TopSAP proprietary 客户端、Debian/Alpine 基础镜像及运行时依赖不因本仓库的 MIT 许可而获得再授权；第三方来源和权利见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+仓库包装器源码采用 [MIT License](LICENSE)。TopSAP 专有客户端、Debian/Alpine 基础镜像及运行时依赖不因本仓库的 MIT 许可而获得再授权；第三方来源和权利见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
