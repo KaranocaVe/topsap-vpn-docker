@@ -21,8 +21,19 @@ def candidates():
             with urlopen(source, timeout=20) as response:
                 raw = response.read(1024 * 1024).decode()
             if source == SOURCES[0]:
-                rows = json.loads(raw)['data']
-                proxies.extend('http://' + row['ip'] + ':' + row['port'] for row in rows)
+                data = json.loads(raw)
+                rows = data.get('data', []) if isinstance(data, dict) else []
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    host, port = row.get('ip'), row.get('port')
+                    if not isinstance(host, str) or not isinstance(port, (str, int)):
+                        continue
+                    if ':' in host and not host.startswith('['):
+                        host = '[' + host + ']'
+                    proxies.append(f'http://{host}:{port}')
             else:
                 proxies.extend(raw.splitlines())
         except (OSError, ValueError, KeyError):
@@ -32,11 +43,14 @@ def candidates():
         try:
             parsed = urlsplit(proxy)
             if (parsed.scheme not in ('http', 'https') or parsed.username or parsed.password
+                    or parsed.port is None or parsed.path not in ('', '/')
+                    or parsed.query or parsed.fragment
                     or not ipaddress.ip_address(parsed.hostname).is_global
                     or not 0 < parsed.port < 65536):
                 continue
             # Lists use 'https' to denote CONNECT support, not TLS to the proxy.
-            value = 'http://' + parsed.hostname + ':' + str(parsed.port)
+            host = '[' + parsed.hostname + ']' if ':' in parsed.hostname else parsed.hostname
+            value = 'http://' + host + ':' + str(parsed.port)
             if value not in result:
                 result.append(value)
         except ValueError:

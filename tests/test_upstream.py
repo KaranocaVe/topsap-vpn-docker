@@ -104,7 +104,34 @@ class TransportTests(unittest.TestCase):
 http://10.0.0.1:80
 http://user:pass@8.8.8.8:80
 http://8.8.8.8:8080
+http://8.8.8.8
+http://8.8.8.8:
+http://8.8.8.8:8080?token=x
 file:///tmp/x
 '''
         with patch.object(public_proxy, 'urlopen', side_effect=[OSError(), io.BytesIO(raw)]):
             self.assertEqual(public_proxy.candidates(), ['http://8.8.8.8:8080'])
+
+    def test_proxy_json_handles_numeric_ports_and_malformed_rows(self):
+        import public_proxy
+        raw = json.dumps({'data': [None, {}, {'ip': '8.8.8.8', 'port': 8080},
+                                   {'ip': '2001:4860:4860::8888', 'port': '8080'}]}).encode()
+        with patch.object(public_proxy, 'urlopen', side_effect=[io.BytesIO(raw), OSError()]):
+            self.assertEqual(public_proxy.candidates(),
+                             ['http://8.8.8.8:8080', 'http://[2001:4860:4860::8888]:8080'])
+
+    def test_proxy_mismatch_retries_without_accepting_invalid_bytes(self):
+        payload = b'complete'
+        expected = {'sha256': hashlib.sha256(payload).hexdigest(), 'size': len(payload)}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'package.deb'
+            with patch.object(upstream, 'PUBLIC_PROXY', True), \
+                    patch.object(upstream, 'open_url', side_effect=[io.BytesIO(b'tampered'), io.BytesIO(payload)]):
+                upstream.fetch_package(upstream.SOURCE + 'package.deb', target, expected)
+            self.assertEqual(target.read_bytes(), payload)
+            with patch.object(upstream, 'PUBLIC_PROXY', True), \
+                    patch.object(upstream, 'open_url', side_effect=lambda _: io.BytesIO(b'tampered')):
+                with self.assertRaises(upstream.PackageMismatch):
+                    upstream.fetch_package(upstream.SOURCE + 'package.deb', target, expected)
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(list(Path(directory).iterdir()), [target])
