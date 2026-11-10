@@ -5,4 +5,5 @@
 !sudo
 !scripts/
 !scripts/upstream.py
+!scripts/public_proxy.py
 !packages.lock.json

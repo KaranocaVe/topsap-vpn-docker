@@ -58,6 +58,8 @@ jobs:
           load: true
           push: false
           tags: ${{ env.IMAGE }}:${{ github.run_id }}-${{ matrix.arch }}
+          build-args: |
+            TOPSAP_PUBLIC_PROXY=1
           provenance: false
           sbom: false
       - name: Run credential-free smoke checks

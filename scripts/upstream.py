@@ -2,6 +2,7 @@
 """Discover official TopSAP DEBs and fetch SHA256-locked build inputs."""
 import argparse
 import hashlib
+from http.client import HTTPException
 from html.parser import HTMLParser
 import json
 import os
@@ -11,7 +12,7 @@ import tempfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 SOURCE = 'https://app.topsec.com.cn/'
 ARCHES = ('amd64', 'arm64')
@@ -35,19 +36,47 @@ class OfficialRedirects(HTTPRedirectHandler):
 
 
 OPENER = build_opener(OfficialRedirects())
+PUBLIC_PROXY = False
+PROXY_OPENERS = None
+PROXY_INDEX = 0
+
+
+def network_openers():
+    global PROXY_OPENERS
+    if not PUBLIC_PROXY:
+        return [OPENER]
+    if PROXY_OPENERS is None:
+        try:
+            with OPENER.open(Request(SOURCE, method='HEAD'), timeout=8):
+                pass
+            PROXY_OPENERS = [OPENER]
+        except (OSError, HTTPException):
+            # Only official public downloads use these untrusted transports.
+            # TLS validation and OfficialRedirects remain enabled end to end.
+            from public_proxy import find_proxies
+            PROXY_OPENERS = [build_opener(ProxyHandler({'https': proxy}), OfficialRedirects())
+                             for proxy in find_proxies()]
+    return PROXY_OPENERS
+
+
+def rotate_proxy():
+    global PROXY_INDEX
+    PROXY_INDEX += 1
 
 
 def open_url(url):
     request = Request(official_url(url), headers={'User-Agent': 'topsap-vpn-docker/1.0'})
+    openers = network_openers()
     for attempt in range(3):
         try:
-            return OPENER.open(request, timeout=60)
+            return openers[PROXY_INDEX % len(openers)].open(request, timeout=30)
         except HTTPError as error:
             if error.code < 500 or attempt == 2:
                 raise
-        except (URLError, TimeoutError):
+        except (OSError, HTTPException):
             if attempt == 2:
                 raise
+        rotate_proxy()
         time.sleep(2 ** attempt)
 
 
@@ -125,12 +154,13 @@ def read_lock(path):
     return lock
 
 
-def fetch_package(url, output, expected=None):
+def fetch_package_once(url, output, expected=None):
     target = Path(output)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         digest, size = hashlib.sha256(), 0
+        deadline = time.monotonic() + 15 * 60
         with open_url(url) as response, tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
             temporary = Path(stream.name)
             while True:
@@ -140,6 +170,8 @@ def fetch_package(url, output, expected=None):
                 size += len(block)
                 if size > MAX_PACKAGE_BYTES:
                     raise ValueError('Package exceeds download size limit')
+                if time.monotonic() > deadline:
+                    raise TimeoutError('Package download exceeded 15 minutes')
                 digest.update(block)
                 stream.write(block)
         result = {'sha256': digest.hexdigest(), 'size': size}
@@ -153,6 +185,17 @@ def fetch_package(url, output, expected=None):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def fetch_package(url, output, expected=None):
+    for attempt in range(3):
+        try:
+            return fetch_package_once(url, output, expected)
+        except (OSError, HTTPException):
+            if attempt == 2:
+                raise
+            rotate_proxy()
+            print('Download transport failed; retrying with another available route', flush=True)
 
 
 def update(path):
@@ -184,6 +227,7 @@ def update(path):
 
 
 def main():
+    global PUBLIC_PROXY
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     refresh = commands.add_parser('update')
@@ -192,7 +236,11 @@ def main():
     download.add_argument('--arch', choices=ARCHES, required=True)
     download.add_argument('--output', required=True)
     download.add_argument('--lock', default='packages.lock.json')
+    for command in (refresh, download):
+        command.add_argument('--public-proxy', action='store_true',
+                             help='If direct HTTPS fails, discover public CONNECT proxies for official files only')
     args = parser.parse_args()
+    PUBLIC_PROXY = args.public_proxy
     if args.command == 'update':
         update(args.output)
     else:

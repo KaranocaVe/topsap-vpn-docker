@@ -57,7 +57,7 @@ def probe(proxy):
     return None
 
 
-def main():
+def find_proxies():
     available = candidates()
     print('Probing', len(available), 'public CONNECT endpoints', flush=True)
     good = []
@@ -69,7 +69,11 @@ def main():
                 print('TLS-verified official catalog via', proxy, flush=True)
     if not good:
         raise SystemExit('No public proxy reached the official HTTPS catalog')
-    print(json.dumps({'proxies': good}))
+    return good
+
+
+def main():
+    print(json.dumps({'proxies': find_proxies()}))
 
 
 if __name__ == '__main__':

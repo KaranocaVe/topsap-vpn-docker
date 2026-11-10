@@ -4,11 +4,13 @@ FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:734a72b3d6142a71993b4
 COPY --from=certificates /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
 RUN sed -i 's#http://deb.debian.org#https://deb.debian.org#' /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=3 update \
-    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends python3 ca-certificates \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends python3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
-COPY scripts/upstream.py packages.lock.json /build/
-RUN python3 /build/upstream.py download --arch "$TARGETARCH" --lock /build/packages.lock.json --output /tmp/topsap.deb \
+ARG TOPSAP_PUBLIC_PROXY=0
+COPY scripts/upstream.py scripts/public_proxy.py packages.lock.json /build/
+RUN case "$TOPSAP_PUBLIC_PROXY" in 1) set -- --public-proxy;; 0) set --;; *) exit 1;; esac \
+    && python3 /build/upstream.py download --arch "$TARGETARCH" --lock /build/packages.lock.json --output /tmp/topsap.deb "$@" \
     && test "$(dpkg-deb -f /tmp/topsap.deb Package)" = cn.com.topvpn \
     && test "$(dpkg-deb -f /tmp/topsap.deb Architecture)" = "$TARGETARCH" \
     && test "$(dpkg-deb -f /tmp/topsap.deb Version)" = "$(python3 -c 'import json,sys; print(json.load(open("/build/packages.lock.json"))["packages"][sys.argv[1]]["version"])' "$TARGETARCH")" \

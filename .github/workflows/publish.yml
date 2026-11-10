@@ -92,6 +92,8 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
+          build-args: |
+            TOPSAP_PUBLIC_PROXY=1
           provenance: false
           sbom: false
       - name: Pull published digest for smoke checks

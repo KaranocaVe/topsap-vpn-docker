@@ -52,7 +52,7 @@ while pending:
     if "not found" in output:
         raise SystemExit(f"unresolved runtime ELF dependency in {path}:\n{output}")
     if result.returncode and "not a dynamic executable" not in output and "statically linked" not in output:
-        raise SystemExit(f"ldd failed for {path}:\\n{output}")
+        raise SystemExit(f"ldd failed for {path}:\n{output}")
     for line in result.stdout.splitlines():
         match = re.search(r"=>\s+(\S+)", line) or re.match(r"\s*(/\S+)", line)
         if not match:

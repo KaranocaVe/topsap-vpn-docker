@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: '3.x'
       - name: Update upstream lock
-        run: python3 scripts/upstream.py update --output packages.lock.json
+        run: python3 scripts/upstream.py update --output packages.lock.json --public-proxy
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Commit and push changed lock
