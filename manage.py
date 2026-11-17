@@ -24,6 +24,11 @@ def load():
     values['SOCKS_PORT'] = int(values.get('SOCKS_PORT', '1080'))
     if not 1 <= values['SOCKS_PORT'] <= 65535:
         raise ValueError('Invalid .env setting: SOCKS_PORT')
+    if values['SOCKS_TLS'] == '1':
+        for key, default in (('SOCKS_TLS_CERT_FILE', 'runtime/tls/server.crt'),
+                             ('SOCKS_TLS_KEY_FILE', 'runtime/tls/server.key')):
+            path = Path(values.get(key, default)).expanduser()
+            values[key] = str((ROOT / path).resolve())
     if values.get('DEBUG_DESKTOP', '0') not in ('0', '1'):
         raise ValueError('DEBUG_DESKTOP must be 0 or 1')
     image = values.get('TOPSAP_IMAGE', 'ghcr.io/karanocave/topsap-vpn-docker:latest')
@@ -34,11 +39,15 @@ def load():
 
 
 def compose(values, *args, capture=False):
-    # Only the nonsecret published port enters Compose's environment.
+    # Only nonsecret deployment settings enter Compose's environment.
     env = dict(os.environ, SOCKS_PORT=str(values['SOCKS_PORT']),
+               SOCKS_BIND=values['SOCKS_BIND'],
                TOPSAP_IMAGE=values['TOPSAP_IMAGE'])
     cmd = ['docker', 'compose', '--project-directory', str(ROOT),
            '--env-file', os.devnull, '-f', str(ROOT / 'compose.yaml')]
+    if values.get('SOCKS_TLS', '0') == '1':
+        env.update({key: values[key] for key in ('SOCKS_TLS_CERT_FILE', 'SOCKS_TLS_KEY_FILE')})
+        cmd += ['-f', str(ROOT / 'compose.tls.yaml')]
     if values.get('DEBUG_DESKTOP', '0') == '1':
         cmd += ['-f', str(ROOT / 'compose.debug.yaml')]
     return subprocess.run(cmd + list(args), env=env, check=True,
@@ -61,7 +70,10 @@ def wait_healthy(values, timeout):
         result = compose(values, 'ps', '--all', '--format', 'json', capture=True).stdout.strip()
         rows = [json.loads(line) for line in result.splitlines() if line]
         if rows and rows[0].get('Health') == 'healthy':
-            print(f"VPN healthy; SOCKS5 at 127.0.0.1:{values['SOCKS_PORT']}")
+            address = values['SOCKS_BIND']
+            if ':' in address:
+                address = f'[{address}]'
+            print(f"VPN healthy; SOCKS5 listening at {address}:{values['SOCKS_PORT']}")
             return
         if rows and rows[0].get('State') in ('exited', 'dead'):
             raise RuntimeError('VPN container exited; inspect ./manage.py logs')

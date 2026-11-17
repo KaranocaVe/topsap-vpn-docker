@@ -1,6 +1,7 @@
 import ipaddress
 import json
 import socket
+import ssl
 import struct
 import subprocess
 from urllib.parse import urlsplit
@@ -106,12 +107,28 @@ def socks_connect(sock, host, port, *, username=None, password=None):
         raise ConnectionError('SOCKS destination connection failed')
 
 
-def probe(host, port, proxy_host='127.0.0.1', proxy_port=1080, *, username=None, password=None):
+def tls_probe_options(config):
+    if config.get('SOCKS_TLS', '0') == '1':
+        return {'tls_ca': '/run/secrets/socks-tls.crt',
+                'tls_server_name': config['SOCKS_TLS_SERVER_NAME']}
+    return {}
+
+
+def probe(host, port, proxy_host='127.0.0.1', proxy_port=1080, *, username=None, password=None,
+          tls_ca=None, tls_server_name=None):
+    if tls_server_name is not None and tls_ca is None:
+        raise ValueError('TLS server name requires a trusted certificate')
     with socket.create_connection((proxy_host, proxy_port), timeout=5) as sock:
-        socks_connect(sock, host, port, username=username, password=password)
+        if tls_ca is None:
+            socks_connect(sock, host, port, username=username, password=password)
+        else:
+            context = ssl.create_default_context(cafile=tls_ca)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            with context.wrap_socket(sock, server_hostname=tls_server_name or proxy_host) as secure:
+                socks_connect(secure, host, port, username=username, password=password)
 
 
-def install_firewall():
+def install_firewall(*, tls=False):
     # Proxy replies to accepted clients may use eth0. New outbound proxy
     # connections, including DNS, must use TUN, even after routes change.
     for tool in ('iptables', 'ip6tables'):
@@ -134,7 +151,7 @@ def install_firewall():
         command(tool, '-w', '-A', 'TOPSAP_INPUT', '-i', 'lo', '-j', 'ACCEPT')
         if tool == 'iptables':
             command(tool, '-w', '-A', 'TOPSAP_INPUT', '-s', gateway, '-j', 'ACCEPT')
-        command(tool, '-w', '-A', 'TOPSAP_INPUT', '-j', 'REJECT')
+        command(tool, '-w', '-A', 'TOPSAP_INPUT', '-j', 'ACCEPT' if tls else 'REJECT')
         rule = ['INPUT', '-p', 'tcp', '--dport', '1080', '-j', 'TOPSAP_INPUT']
         if subprocess.run([tool, '-w', '-C', *rule], capture_output=True).returncode:
             command(tool, '-w', '-I', *rule)

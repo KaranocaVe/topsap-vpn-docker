@@ -4,18 +4,21 @@ import os
 import pathlib
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import time
 
 from config import settings
-from network import command, gateway_firewall, install_firewall, probe, tunnel_for
+from network import command, gateway_firewall, install_firewall, probe, tls_probe_options, tunnel_for
 
 APP = pathlib.Path('/opt/apps/cn.com.topvpn/files')
 RUNTIME = pathlib.Path('/run/topsap')
 PROGRAMS = pathlib.Path(__file__).parent
 BACKEND_SOCKET = pathlib.Path('/tmp/TopSAP_ELE/topsap.sock')
 LEGACY_BACKEND_MARKER = pathlib.Path('/tmp/TopSAP_ELE/.BUFF')
+TLS_CERT = pathlib.Path('/run/secrets/socks-tls.crt')
+TLS_KEY = pathlib.Path('/run/secrets/socks-tls.key')
 STOPPING = False
 
 
@@ -85,12 +88,21 @@ def backend_ready():
 
 
 def start_auth_proxy(config, devnull):
+    values = [config['SOCKS_USERNAME'], config['SOCKS_PASSWORD']]
+    if config.get('SOCKS_TLS', '0') == '1':
+        tls = {}
+        for key, path in (('cert', TLS_CERT), ('key', TLS_KEY)):
+            with path.open() as stream:
+                value = stream.read(64 * 1024 + 1)
+            if len(value.encode('utf-8')) > 64 * 1024:
+                raise ValueError('TLS input exceeds size limit')
+            tls[key] = value
+        values.append(tls)
     process = launch(['setpriv', '--reuid=65534', '--regid=65534', '--clear-groups',
                       '--no-new-privs', sys.executable, str(PROGRAMS / 'auth_proxy.py')],
                      stdin=subprocess.PIPE, **devnull)
     try:
-        payload = json.dumps([config['SOCKS_USERNAME'], config['SOCKS_PASSWORD']],
-                             ensure_ascii=False).encode('utf-8') + b'\n'
+        payload = json.dumps(values, ensure_ascii=False).encode('utf-8') + b'\n'
         process.stdin.write(payload)
         process.stdin.close()
     except Exception:
@@ -169,7 +181,8 @@ def run_cycle(config, original_resolver, on_ready):
         wait_until(lambda: auth_proxy.poll() is None, 2, processes)
         sleep(0.5)
         probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'],
-              username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'])
+              username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'],
+              **tls_probe_options(config))
         status('ready', interface=tunnel_for(config['HEALTHCHECK_HOST']))
         on_ready()
         log('VPN ready; SOCKS5 listening on port 1080 with TUN-only outbound access.')
@@ -182,7 +195,8 @@ def run_cycle(config, original_resolver, on_ready):
                 if not tunnel_for(config['HEALTHCHECK_HOST']):
                     raise RuntimeError('TUN route disappeared')
                 probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'],
-                      username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'])
+                      username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'],
+                      **tls_probe_options(config))
                 failures = 0
                 status('ready', interface=tunnel_for(config['HEALTHCHECK_HOST']))
             except Exception:
@@ -206,12 +220,14 @@ def main():
     for name in ('/run/topsap', '/opt/apps', '/opt/sslvpn/config', os.environ['HOME'], '/dev/net'):
         pathlib.Path(name).mkdir(parents=True, exist_ok=True)
     config = settings()
+    if config.get('SOCKS_TLS', '0') == '1':
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(TLS_CERT, TLS_KEY)
     # Docker Desktop bind-file modes alone do not enforce Linux UID isolation.
     # The parent is native tmpfs, so traversal is enforceably root-only.
     pathlib.Path('/run/secrets').chmod(0o700)
     if not pathlib.Path('/dev/net/tun').exists():
         os.mknod('/dev/net/tun', 0o20600, os.makedev(10, 200))
-    install_firewall()
+    install_firewall(tls=config.get('SOCKS_TLS', '0') == '1')
     original_resolver = 'nameserver 127.0.0.11\noptions timeout:2 attempts:2\n'
     failures = 0
     authentication_failures = 0

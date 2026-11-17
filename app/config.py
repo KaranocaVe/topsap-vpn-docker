@@ -38,6 +38,18 @@ def settings():
             raise ValueError(f'Invalid .env setting: {key}') from None
         if b'\0' in encoded or not 1 <= len(encoded) <= 255:
             raise ValueError(f'Invalid .env setting: {key}')
+    values['SOCKS_TLS'] = values.get('SOCKS_TLS', '0')
+    if values['SOCKS_TLS'] not in ('0', '1'):
+        raise ValueError('SOCKS_TLS must be 0 or 1')
+    try:
+        bind = ipaddress.ip_address(values.get('SOCKS_BIND', '127.0.0.1'))
+    except ValueError:
+        raise ValueError('Invalid .env setting: SOCKS_BIND') from None
+    values['SOCKS_BIND'] = str(bind)
+    if not bind.is_loopback and values['SOCKS_TLS'] != '1':
+        raise ValueError('SOCKS_TLS=1 is required for non-loopback SOCKS_BIND')
+    if values['SOCKS_TLS'] == '1' and not values.get('SOCKS_TLS_SERVER_NAME'):
+        raise ValueError('Missing .env setting: SOCKS_TLS_SERVER_NAME')
     for key in ('VPN_DNS', 'HEALTHCHECK_HOST'):
         ipaddress.ip_address(values[key])
     for key, default, low, high in (('HEALTHCHECK_PORT', '443', 1, 65535),

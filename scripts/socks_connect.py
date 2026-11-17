@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Open a SOCKS5 stream for OpenSSH ProxyCommand use."""
+"""Open an authenticated SOCKS5 stream, optionally over verified TLS."""
 import argparse
+import asyncio
+import contextlib
+import ipaddress
 import os
 from pathlib import Path
 import select
 import signal
 import socket
+import ssl
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -17,6 +22,7 @@ import network
 
 BUFFER_SIZE = 65536
 IO_TIMEOUT = 20
+TLS_EOF_DRAIN_TIMEOUT = 2
 
 
 class QuietParser(argparse.ArgumentParser):
@@ -30,6 +36,9 @@ def parser():
     result.add_argument('--ssh', metavar='SSH_ALIAS')
     result.add_argument('--proxy-host', default='127.0.0.1')
     result.add_argument('--proxy-port', type=int, default=1080)
+    result.add_argument('--tls', action='store_true')
+    result.add_argument('--tls-ca', metavar='PATH')
+    result.add_argument('--tls-server-name', metavar='NAME')
     result.add_argument('host')
     result.add_argument('port', type=int)
     return result
@@ -232,6 +241,107 @@ def relay(endpoint, stdin_fd=None, stdout_fd=None):
                 pass
 
 
+async def _read_fd(reader, source_file):
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), source_file)
+    return transport
+
+
+class _WritePipeProtocol(asyncio.streams.FlowControlMixin):
+    def __init__(self, loop):
+        super().__init__(loop)
+        self.closed = loop.create_future()
+
+    def connection_lost(self, error):
+        super().connection_lost(error)
+        if not self.closed.done():
+            self.closed.set_result(None)
+
+    def _get_close_waiter(self, stream):
+        return self.closed
+
+
+async def _write_fd(destination_file):
+    loop = asyncio.get_running_loop()
+    protocol = _WritePipeProtocol(loop)
+    transport, _ = await loop.connect_write_pipe(lambda: protocol, destination_file)
+    return asyncio.StreamWriter(transport, protocol, None, loop)
+
+
+async def _pipe_stream(reader, writer, idle_timeout=None):
+    while True:
+        if idle_timeout is None:
+            data = await reader.read(BUFFER_SIZE)
+        else:
+            try:
+                data = await asyncio.wait_for(reader.read(BUFFER_SIZE), idle_timeout)
+            except asyncio.TimeoutError:
+                return
+        if not data:
+            return
+        writer.write(data)
+        await writer.drain()
+
+
+async def relay_tls(reader, writer, stdin_fd=None, stdout_fd=None):
+    """Relay a TLS stream through bounded asyncio pipe transports."""
+    stdin_fd = sys.stdin.fileno() if stdin_fd is None else stdin_fd
+    stdout_fd = sys.stdout.fileno() if stdout_fd is None else stdout_fd
+    stdin_file = os.fdopen(os.dup(stdin_fd), 'rb', buffering=0)
+    stdout_file = os.fdopen(os.dup(stdout_fd), 'wb', buffering=0)
+    stdin_transport = None
+    stdout_writer = None
+    tasks = set()
+    try:
+        stdin_reader = asyncio.StreamReader(limit=BUFFER_SIZE)
+        stdin_transport = await _read_fd(stdin_reader, stdin_file)
+        stdout_writer = await _write_fd(stdout_file)
+        upload_task = asyncio.create_task(_pipe_stream(stdin_reader, writer))
+        download_task = asyncio.create_task(_pipe_stream(reader, stdout_writer))
+        tasks = {upload_task, download_task}
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+        if upload_task in done and download_task not in done:
+            # Cancel any unbounded read and restart with an idle deadline.
+            # StreamReader keeps unread TLS plaintext buffered across cancellation.
+            download_task.cancel()
+            await asyncio.gather(download_task, return_exceptions=True)
+            tasks.remove(download_task)
+            await asyncio.wait_for(stdout_writer.drain(), timeout=IO_TIMEOUT)
+            download_task = asyncio.create_task(
+                _pipe_stream(reader, stdout_writer, TLS_EOF_DRAIN_TIMEOUT))
+            tasks.add(download_task)
+            await download_task
+        else:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if stdin_transport is not None:
+            stdin_transport.close()
+        with contextlib.suppress(Exception):
+            stdin_file.close()
+        if stdout_writer is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(stdout_writer.drain(), timeout=1)
+            stdout_writer.close()
+            try:
+                await asyncio.wait_for(stdout_writer.wait_closed(), timeout=1)
+            except Exception:
+                stdout_writer.transport.abort()
+        else:
+            with contextlib.suppress(Exception):
+                stdout_file.close()
+
+
 def _stop_child(process):
     if process is None:
         return
@@ -278,10 +388,116 @@ def _restore_signals(previous):
         signal.signal(sig, handler)
 
 
+async def socks_connect_tls(reader, writer, host, port, username, password):
+    try:
+        user = username.encode('utf-8')
+        secret = password.encode('utf-8')
+    except UnicodeEncodeError:
+        raise ValueError('Invalid SOCKS credential') from None
+    if (not 1 <= len(user) <= 255 or not 1 <= len(secret) <= 255
+            or b'\0' in user or b'\0' in secret):
+        raise ValueError('Invalid SOCKS credential')
+
+    writer.write(b'\x05\x01\x02')
+    await writer.drain()
+    if await reader.readexactly(2) != b'\x05\x02':
+        raise ConnectionError('SOCKS authentication negotiation failed')
+    writer.write(b'\x01' + bytes([len(user)]) + user + bytes([len(secret)]) + secret)
+    await writer.drain()
+    if await reader.readexactly(2) != b'\x01\x00':
+        raise ConnectionError('SOCKS username/password authentication failed')
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            encoded = host.encode('idna')
+        except (AttributeError, UnicodeError):
+            raise ValueError('Invalid SOCKS destination host') from None
+        if not encoded or len(encoded) > 255 or b'\0' in encoded:
+            raise ValueError('Invalid SOCKS destination host')
+        address_type = b'\x03'
+        address_bytes = bytes([len(encoded)]) + encoded
+    else:
+        address_type = b'\x01' if address.version == 4 else b'\x04'
+        address_bytes = address.packed
+    if not 1 <= port <= 65535:
+        raise ValueError('Invalid SOCKS destination port')
+    writer.write(b'\x05\x01\x00' + address_type + address_bytes + struct.pack('>H', port))
+    await writer.drain()
+
+    reply = await reader.readexactly(4)
+    if reply[0] != 5:
+        raise ConnectionError('Invalid SOCKS connect reply version')
+    if reply[2] != 0:
+        raise ConnectionError('Invalid SOCKS connect reply reserved field')
+    if reply[3] == 1:
+        address_size = 4
+    elif reply[3] == 4:
+        address_size = 16
+    elif reply[3] == 3:
+        address_size = (await reader.readexactly(1))[0]
+        if not address_size:
+            raise ConnectionError('Invalid SOCKS connect reply address')
+    else:
+        raise ConnectionError('Invalid SOCKS connect reply address type')
+    await reader.readexactly(address_size + 2)
+    if reply[1] != 0:
+        raise ConnectionError('SOCKS destination connection failed')
+
+
+def tls_context(ca_file=None):
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
+async def _run_tls(args, username, password, server_name, stdin_fd, stdout_fd):
+    context = tls_context(args.tls_ca)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(
+            args.proxy_host, args.proxy_port, ssl=context,
+            server_hostname=server_name, limit=BUFFER_SIZE),
+        timeout=IO_TIMEOUT,
+    )
+    try:
+        # asyncio completes certificate and hostname verification before SOCKS
+        # credentials can enter the TLS application stream.
+        await asyncio.wait_for(
+            socks_connect_tls(reader, writer, args.host, args.port, username, password),
+            timeout=IO_TIMEOUT,
+        )
+        await relay_tls(reader, writer, stdin_fd, stdout_fd)
+        return 0
+    finally:
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=1)
+        except Exception:
+            writer.transport.abort()
+
+
 def run(args, stdin_fd=None, stdout_fd=None):
+    if args.tls and args.ssh:
+        raise ValueError('--tls cannot be combined with --ssh')
+    if not args.tls and (args.tls_ca is not None or args.tls_server_name is not None):
+        raise ValueError('--tls-ca and --tls-server-name require --tls')
+    server_name = args.tls_server_name if args.tls_server_name is not None else args.proxy_host
+    if args.tls and not server_name:
+        raise ValueError('invalid TLS server name')
+
     username, password = read_credentials(args.credentials)
     if not 1 <= args.proxy_port <= 65535 or not 1 <= args.port <= 65535:
         raise ValueError('invalid port')
+
+    if args.tls:
+        return asyncio.run(_run_tls(
+            args, username, password, server_name,
+            sys.stdin.fileno() if stdin_fd is None else stdin_fd,
+            sys.stdout.fileno() if stdout_fd is None else stdout_fd,
+        ))
 
     endpoint = None
     process = None
@@ -296,8 +512,9 @@ def run(args, stdin_fd=None, stdout_fd=None):
             )
             endpoint = PipeSocket(process.stdin, process.stdout)
         else:
-            endpoint = socket.create_connection(
+            raw_socket = socket.create_connection(
                 (args.proxy_host, args.proxy_port), timeout=IO_TIMEOUT)
+            endpoint = raw_socket
             endpoint.settimeout(IO_TIMEOUT)
 
         network.socks_connect(endpoint, args.host, args.port,

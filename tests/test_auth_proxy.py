@@ -3,13 +3,17 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import ssl
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
-from auth_proxy import AuthProxy, _close_writer, read_credentials
+sys.path.insert(0, str(ROOT / 'tests'))
+from auth_proxy import AuthProxy, _close_writer, load_tls_context, read_credentials
+from tls_helpers import temporary_tls_certificates
 
 
 USERNAME = 'proxy-user'
@@ -136,9 +140,9 @@ class AuthProxyTests(unittest.IsolatedAsyncioTestCase):
             await writer.wait_closed()
 
             reader, writer = await self.connect(proxy_port)
-            writer.write(b'\x05\x01\x00')
+            writer.write(b'\x05\x02\x00\x02')
             await writer.drain()
-            self.assertEqual(await reader.readexactly(2), b'\x05\xff')
+            self.assertEqual(await reader.readexactly(2), b'\x05\x02')
             writer.close()
             await writer.wait_closed()
 
@@ -248,13 +252,106 @@ class AuthProxyTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
 
+    async def test_tls_auth_relay_and_backend_eof_close_tls_stream(self):
+        payload = b'backend response\x00\xff'
+        received = {}
+
+        async def backend_handler(reader, writer):
+            try:
+                received['greeting'] = await reader.readexactly(3)
+                writer.write(b'\x05\x00')
+                await writer.drain()
+                received['request'] = await reader.readexactly(len(CONNECT_REQUEST))
+                writer.write(CONNECT_REPLY + payload)
+                await writer.drain()
+                writer.write_eof()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        self.backend, backend_port = await start_listener(backend_handler)
+        with temporary_tls_certificates() as fixture:
+            context = load_tls_context({'cert': fixture.cert_pem, 'key': fixture.key_pem})
+            self.assertGreaterEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+            proxy_port = await self.start_proxy(backend_port, ssl_context=context)
+            client_context = fixture.trusted_client_context()
+            reader, writer = await asyncio.open_connection(
+                '127.0.0.1', proxy_port, ssl=client_context, server_hostname='localhost')
+            self.assertEqual(await authenticate(reader, writer), b'\x01\x00')
+            writer.write(CONNECT_REQUEST)
+            await writer.drain()
+            self.assertEqual(await reader.readexactly(len(CONNECT_REPLY)), CONNECT_REPLY)
+            self.assertEqual(await asyncio.wait_for(read_to_eof(reader), 2), payload)
+            writer.close()
+            await writer.wait_closed()
+
+        self.assertEqual(received, {
+            'greeting': b'\x05\x01\x00',
+            'request': CONNECT_REQUEST,
+        })
+
+    async def test_tls_rejects_plain_untrusted_and_wrong_hostname_clients(self):
+        backend_connections = 0
+
+        async def backend_handler(reader, writer):
+            nonlocal backend_connections
+            backend_connections += 1
+            writer.close()
+            await writer.wait_closed()
+
+        self.backend, backend_port = await start_listener(backend_handler)
+        with temporary_tls_certificates() as fixture:
+            context = load_tls_context({'cert': fixture.cert_pem, 'key': fixture.key_pem})
+            proxy_port = await self.start_proxy(backend_port, ssl_context=context)
+
+            reader, writer = await self.connect(proxy_port)
+            writer.write(b'\x05\x01\x02')
+            await writer.drain()
+            try:
+                data = await asyncio.wait_for(reader.read(1), 0.05)
+            except (asyncio.TimeoutError, ConnectionResetError):
+                data = b''
+            self.assertEqual(data, b'')
+            writer.close()
+            with contextlib.suppress(ConnectionResetError, ssl.SSLError):
+                await writer.wait_closed()
+
+            for client_context, server_hostname in (
+                    (ssl.create_default_context(), 'localhost'),
+                    (fixture.trusted_client_context(), 'wrong.example')):
+                with self.assertRaises((ssl.SSLError, OSError)):
+                    await asyncio.wait_for(
+                        asyncio.open_connection(
+                            '127.0.0.1', proxy_port, ssl=client_context,
+                            server_hostname=server_hostname),
+                        2)
+
+        self.assertEqual(backend_connections, 0)
+
     def test_credentials_are_bounded_json_and_never_logged(self):
         payload = json.dumps([USERNAME, PASSWORD], ensure_ascii=False).encode()
-        self.assertEqual(read_credentials(io.BytesIO(payload)), (USERNAME, PASSWORD))
+        self.assertEqual(read_credentials(io.BytesIO(payload)), (USERNAME, PASSWORD, None))
         with self.assertRaises(ValueError):
             read_credentials(io.BytesIO(b'[]'))
         with self.assertRaises(ValueError):
             read_credentials(io.BytesIO(json.dumps(['u\x00', 'p']).encode()))
+        tls_payload = json.dumps([
+            USERNAME, PASSWORD, {'cert': 'CERT', 'key': 'KEY'}]).encode()
+        self.assertEqual(
+            read_credentials(io.BytesIO(tls_payload)),
+            (USERNAME, PASSWORD, {'cert': 'CERT', 'key': 'KEY'}))
+        with self.assertRaises(ValueError):
+            read_credentials(io.BytesIO(b' ' * (128 * 1024 + 1)))
+        with self.assertRaises(ValueError):
+            read_credentials(io.BytesIO(b' ' * 4097), max_bytes=4096)
+        with self.assertRaises(ValueError):
+            read_credentials(io.BytesIO(json.dumps([
+                USERNAME, PASSWORD, {'cert': 'CERT'}]).encode()))
+        with temporary_tls_certificates() as fixture:
+            with tempfile.TemporaryDirectory() as temporary:
+                with mock.patch('auth_proxy.tempfile.tempdir', temporary):
+                    load_tls_context({'cert': fixture.cert_pem, 'key': fixture.key_pem})
+                self.assertEqual(list(Path(temporary).iterdir()), [])
 
     async def test_close_writer_aborts_after_bounded_wait(self):
         class StuckWriter:
@@ -275,8 +372,6 @@ class AuthProxyTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch('auth_proxy.CLOSE_TIMEOUT', 0.01):
             await _close_writer(writer)
         self.assertTrue(writer.aborted)
-        with self.assertRaises(ValueError):
-            read_credentials(io.BytesIO(b'"' + b'a' * 4096 + b'"'))
 
 
 async def _close_test_writer(writer):

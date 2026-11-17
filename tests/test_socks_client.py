@@ -5,6 +5,7 @@ from pathlib import Path
 import select
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -17,7 +18,9 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT / 'app'))
+sys.path.insert(0, str(ROOT / 'tests'))
 import socks_connect as client
+from tls_helpers import temporary_tls_certificates
 
 
 def exact(sock, size):
@@ -28,6 +31,14 @@ def exact(sock, size):
             raise ConnectionError('unexpected EOF in test server')
         data.extend(part)
     return bytes(data)
+
+
+def _read_all(fd, output):
+    while True:
+        data = os.read(fd, 65536)
+        if not data:
+            return
+        output.extend(data)
 
 
 def socks_request(sock):
@@ -65,6 +76,196 @@ class SocksClientTests(unittest.TestCase):
         path.write_text('SOCKS_USERNAME="test user"\nSOCKS_PASSWORD="secret-value"\n')
         path.chmod(mode)
         return path
+
+    def tls_server_context(self, fixture):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(str(fixture.cert_path), str(fixture.key_path))
+        return context
+
+    def start_tls_server(self, listener, context, handler, errors,
+                         *, expected_tls_failure=False, accepted=None):
+        def serve():
+            try:
+                connection, _ = listener.accept()
+                if accepted is not None:
+                    accepted.set()
+                with connection:
+                    connection.settimeout(5)
+                    with context.wrap_socket(connection, server_side=True) as secure:
+                        handler(secure)
+            except Exception as error:
+                expected_errors = (ssl.SSLError, ConnectionAbortedError,
+                                   ConnectionResetError, BrokenPipeError, TimeoutError)
+                if not (expected_tls_failure and isinstance(error, expected_errors)):
+                    errors.append(error)
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        return server
+
+    def test_tls_echo_verifies_proxy_certificate_and_relays_bounded_binary_data(self):
+        payload = bytes(range(256)) * 768 + b'\x00tls-binary\xff'
+        received = {}
+        server_errors = []
+        with tempfile.TemporaryDirectory() as directory, \
+                temporary_tls_certificates() as fixture:
+            credentials = self.credentials(directory)
+            with socket.socket() as listener:
+                listener.bind(('127.0.0.1', 0))
+                listener.listen(1)
+                listener.settimeout(5)
+                port = listener.getsockname()[1]
+
+                def serve(secure):
+                    received['credentials'] = socks_request(secure)
+                    secure.sendall(b'\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50')
+                    received['payload'] = exact(secure, len(payload))
+                    secure.sendall(received['payload'])
+
+                server = self.start_tls_server(
+                    listener, self.tls_server_context(fixture), serve, server_errors)
+                input_read, input_write = os.pipe()
+                output_read, output_write = os.pipe()
+                output = bytearray()
+                reader = threading.Thread(
+                    target=lambda: _read_all(output_read, output), daemon=True)
+                results = []
+                stderr = io.StringIO()
+                argv = [
+                    '--credentials', str(credentials), '--proxy-port', str(port),
+                    '--tls', '--tls-ca', str(fixture.cert_path),
+                    '--tls-server-name', 'localhost',
+                    'service.example', '443',
+                ]
+                try:
+                    reader.start()
+                    with contextlib.redirect_stderr(stderr):
+                        runner = threading.Thread(
+                            target=lambda: results.append(client.main(
+                                argv, input_read, output_write)))
+                        runner.start()
+                        view = memoryview(payload)
+                        while view:
+                            count = os.write(input_write, view[:16384])
+                            view = view[count:]
+                        server.join(timeout=5)
+                        self.assertFalse(server.is_alive(), 'TLS server did not finish')
+                        runner.join(timeout=5)
+                        self.assertFalse(runner.is_alive(), 'TLS relay did not finish after peer close')
+                    os.close(output_write)
+                    output_write = -1
+                    reader.join(timeout=5)
+                finally:
+                    for fd in (input_read, output_read, output_write):
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    try:
+                        os.close(input_write)
+                    except OSError:
+                        pass
+
+        self.assertFalse(reader.is_alive(), 'TLS output reader did not finish')
+        self.assertEqual(server_errors, [])
+        self.assertEqual(received['credentials'],
+                         (b'test user', b'secret-value', 'service.example', 443))
+        self.assertEqual(received['payload'], payload)
+        self.assertEqual(results, [0])
+        self.assertEqual(bytes(output), payload)
+        self.assertEqual(stderr.getvalue(), '')
+        self.assertEqual(client.tls_context().minimum_version, ssl.TLSVersion.TLSv1_2)
+
+    def test_tls_rejects_untrusted_and_mismatched_certificates_before_socks_auth(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                temporary_tls_certificates() as fixture:
+            credentials = self.credentials(directory)
+            for extra_args in ([], [
+                    '--tls-ca', str(fixture.cert_path),
+                    '--tls-server-name', 'wrong.example']):
+                with self.subTest(extra_args=extra_args):
+                    server_errors = []
+                    application_data = bytearray()
+                    accepted = threading.Event()
+                    with socket.socket() as listener:
+                        listener.bind(('127.0.0.1', 0))
+                        listener.listen(1)
+                        listener.settimeout(5)
+                        port = listener.getsockname()[1]
+
+                        def inspect_client(secure):
+                            try:
+                                secure.settimeout(0.5)
+                                while data := secure.recv(4096):
+                                    application_data.extend(data)
+                            except (ssl.SSLError, TimeoutError):
+                                pass
+
+                        server = self.start_tls_server(
+                            listener, self.tls_server_context(fixture), inspect_client,
+                            server_errors, expected_tls_failure=True, accepted=accepted)
+                        stderr = io.StringIO()
+                        stdin_read, stdin_write = os.pipe()
+                        stdout_read, stdout_write = os.pipe()
+                        original_run = client.run
+                        run_errors = []
+
+                        def capture_run_error(*args, **kwargs):
+                            try:
+                                return original_run(*args, **kwargs)
+                            except Exception as error:
+                                run_errors.append(error)
+                                raise
+
+                        try:
+                            with contextlib.redirect_stderr(stderr), \
+                                    patch.object(client, 'run', side_effect=capture_run_error):
+                                result = client.main([
+                                    '--credentials', str(credentials), '--proxy-port', str(port),
+                                    '--tls', *extra_args, 'service.example', '443',
+                                ], stdin_read, stdout_write)
+                            os.close(stdout_write)
+                            stdout_write = -1
+                            stdout = bytearray()
+                            while data := os.read(stdout_read, 4096):
+                                stdout.extend(data)
+                        finally:
+                            for fd in (stdin_read, stdin_write, stdout_read, stdout_write):
+                                try:
+                                    os.close(fd)
+                                except OSError:
+                                    pass
+                        server.join(timeout=5)
+
+                    self.assertFalse(server.is_alive(), 'TLS rejection fixture did not finish')
+                    self.assertTrue(
+                        accepted.is_set(),
+                        f'TLS client did not reach certificate check: {run_errors!r}')
+                    self.assertEqual(result, 1)
+                    self.assertEqual(len(run_errors), 1)
+                    self.assertIsInstance(run_errors[0], ssl.SSLCertVerificationError)
+                    self.assertEqual(bytes(stdout), b'')
+                    self.assertEqual(stderr.getvalue(), 'socks-connect: connection failed\n')
+                    self.assertEqual(bytes(application_data), b'')
+                    self.assertEqual(server_errors, [])
+
+    def test_tls_options_are_rejected_without_tls_or_with_ssh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credentials = self.credentials(directory)
+            for options in (
+                    ['--tls-ca', str(Path(directory) / 'ca.pem')],
+                    ['--tls-server-name', 'localhost'],
+                    ['--tls', '--ssh', 'proxy-host']):
+                with self.subTest(options=options):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        result = client.main([
+                            '--credentials', str(credentials), *options,
+                            'service.example', '443',
+                        ])
+                    self.assertEqual(result, 1)
+                    self.assertEqual(stderr.getvalue(), 'socks-connect: connection failed\n')
 
     def test_private_credentials_and_local_echo_with_half_close(self):
         payload = bytes(range(256)) * 2048 + b'\x00binary\xff'

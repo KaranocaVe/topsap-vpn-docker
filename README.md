@@ -1,6 +1,6 @@
 # TopSAP VPN Docker
 
-用 Docker 封装 TopSAP Linux 客户端，将 VPN 连接和 SOCKS5 代理限制在容器内。本机只看到回环地址上的 SOCKS5 代理端口，其他应用可按需使用该代理访问 VPN 内网。
+用 Docker 封装 TopSAP Linux 客户端，将 VPN 连接和 SOCKS5 代理运行在容器内。应用可通过鉴权 SOCKS5 代理访问 VPN 内网；代理默认绑定宿主机回环地址，公网接入使用项目原生的 SOCKS5 over TLS。
 
 项目地址：[`KaranocaVe/topsap-vpn-docker`](https://github.com/KaranocaVe/topsap-vpn-docker)
 
@@ -31,7 +31,7 @@ supervisor → TopSAP 后端、Xvfb/Electron、VPN 登录和 TOTP
 ```
 
 - 容器内负责 TopSAP、TUN、路由、DNS 和 SOCKS5；宿主机不安装 TopSAP。
-- 代理只发布到宿主机回环地址，每条连接都必须鉴权，不提供匿名或按 IP 豁免模式。supervisor 从 secret 读取配置，仅将代理凭证经管道传给 UID 65534 的鉴权前端；MicroSocks 只监听容器内回环地址。
+- 代理默认发布到宿主机回环地址，可用 `SOCKS_BIND` 修改监听地址。非回环地址必须启用 TLS；客户端先校验证书，再提交 SOCKS5 用户名密码。每条连接都必须鉴权，不提供匿名或按 IP 豁免模式。supervisor 从 secret 读取配置，仅将代理凭证及启用 TLS 时的证书、私钥经管道传给 UID 65534 的鉴权前端；MicroSocks 只监听容器内回环地址。
 - 防火墙仅允许代理连接容器内的 MicroSocks 或经 TUN 访问目标；隧道消失时不会回落到普通出口。
 - root 文件系统只读；运行时的厂商文件、配置和浏览器 profile 放在 tmpfs。宿主机只绑定一个用于切换 bootstrap DNS/VPN DNS 的 resolver 文件。
 - 没有 host network、特权容器、Docker socket 或宿主家目录挂载。厂商后端仍以容器 root 运行并需要 `NET_ADMIN`，因此防火墙不构成对已被攻破的容器 root 的安全边界。
@@ -96,12 +96,31 @@ python3 manage.py build
 | `VPN_MTU` | `1280` | TUN MTU，允许范围 1280–1500；链路较敏感时可使用更保守的 MTU。 |
 | `LOGIN_TIMEOUT` | `120` | 单次登录等待隧道的秒数。 |
 | `LOGIN_FAILURE_LIMIT` | `3` | 连续登录失败（含页面、网络和隧道超时）后停止尝试并进入 `needs_attention`。 |
-| `SOCKS_PORT` | `1080` | 仅绑定宿主机 `127.0.0.1`。 |
+| `SOCKS_BIND` | `127.0.0.1` | 宿主机监听 IP；设为 `0.0.0.0` 可在所有 IPv4 网卡接入。支持 IPv4/IPv6 字面地址。 |
+| `SOCKS_PORT` | `1080` | 宿主机发布的 TCP 端口。 |
+| `SOCKS_TLS` | `0` | `1` 启用原生 TLS 入口；非回环 `SOCKS_BIND` 必须启用。TLS 入口不兼容明文 SOCKS5 客户端，也不会降级。 |
+| `SOCKS_TLS_SERVER_NAME` | — | TLS 模式必填，填写证书 SAN 包含的域名或 IP，供容器健康检查校验证书。 |
+| `SOCKS_TLS_CERT_FILE` / `SOCKS_TLS_KEY_FILE` | `runtime/tls/server.crt` / `runtime/tls/server.key` | 宿主机上的 PEM 证书链和无口令私钥路径，可为绝对路径或仓库相对路径；仅 TLS 模式挂载。 |
 | `SOCKS_USERNAME` / `SOCKS_PASSWORD` | — | 每条 SOCKS5 连接都必须提供的独立凭证；各为 1–255 个 UTF-8 字节，不允许 NUL。与 VPN 账号密码分开设置。 |
 | `HEALTHCHECK_HOST` / `HEALTHCHECK_PORT` | `10.0.0.10` / `443` | 必须经 VPN 到达的通用 TCP 探测目标；只检查 TCP 连接，不依赖特定协议或服务 banner。将主机替换为管理员提供的目标 IP。 |
 | `DEBUG_DESKTOP` | `0` | 设为 `1` 后临时发布回环地址上的 noVNC `6080`，只用于排障。入口无额外认证，用完改回 `0` 并重启。 |
 
 凭证文件挂载到容器 `/run/secrets/topsap.env`，不写入镜像、Docker 环境变量或进程参数。拥有 Docker 管理权限的宿主用户仍可访问容器数据；请按本机权限模型保护 Docker。
+
+## 公网 TLS 部署
+
+将证书链与私钥放在 `runtime/tls/server.crt`、`runtime/tls/server.key`，目录权限设为 `0700`，私钥设为 `0600`。证书的 SAN 必须包含客户端连接时使用的域名或 IP；可使用受信 CA 签发的证书，或通过可信渠道分发自签证书。证书和私钥不进入源码或镜像。
+
+服务端 `.env` 配置：
+
+```dotenv
+SOCKS_BIND='0.0.0.0'
+SOCKS_PORT=1080
+SOCKS_TLS=1
+SOCKS_TLS_SERVER_NAME='proxy.example.com'
+```
+
+运行 `python3 manage.py up`，并在主机和云安全组放行该 TCP 端口。管理脚本会自动合并 `compose.tls.yaml`，将证书和私钥作为只读 secret 挂载；健康检查也通过 TLS 校验证书并完成 SOCKS5 鉴权和目标连接。TLS 最低版本为 1.2。
 
 ## 管理命令
 
@@ -139,13 +158,21 @@ Host vpn-server
     ProxyCommand python3 /absolute/path/topsap-vpn-docker/scripts/socks_connect.py --credentials ~/.ssh/topsap-socks.env %h %p
 ```
 
-代理部署在远程服务器时，先为该服务器配置可用的 SSH 别名，例如 `proxy-host`，再把 `ProxyCommand` 改为：
+代理部署在公网服务器时，按上节启用 TLS。客户端直接连接 TLS 入口，将 `ProxyCommand` 改为：
+
+```sshconfig
+    ProxyCommand python3 /absolute/path/topsap-vpn-docker/scripts/socks_connect.py --credentials ~/.ssh/topsap-socks.env --proxy-host proxy.example.com --proxy-port 1080 --tls %h %p
+```
+
+将 `proxy.example.com` 换成代理服务器的公网 IP 或域名。客户端默认校验系统信任链及该名称；使用自签证书或私有 CA 时，加上 `--tls-ca /absolute/path/trusted-proxy.pem`。如连接地址与证书名称不同，可用 `--tls-server-name` 指定要验证的名称。证书验证失败会在发送代理凭证前终止连接，没有跳过验证或回退到明文的选项。
+
+仅监听回环地址的非 TLS 代理仍可通过可选的 `--ssh` 模式接入；先为代理服务器配置 SSH 别名 `proxy-host`：
 
 ```sshconfig
     ProxyCommand python3 /absolute/path/topsap-vpn-docker/scripts/socks_connect.py --credentials ~/.ssh/topsap-socks.env --ssh proxy-host %h %p
 ```
 
-`--ssh` 通过该服务器的 SSH 通道连接其 `127.0.0.1:1080`，不需要在公网开放代理端口，也不需要另开一个常驻转发进程。SOCKS5 用户名密码协议本身不加密，跨机器使用时应保留这一加密通道。将示例路径、目标和账户换成实际值后，运行 `ssh vpn-server`；目标 SSH 仍使用自己的密钥和 `known_hosts`。助手脚本要求凭证文件属于当前用户，且组和其他用户没有任何权限。
+`--ssh` 通过该服务器的 SSH 通道连接其 `127.0.0.1:1080`，不需要在公网开放代理端口，也不需要另开一个常驻转发进程。将示例路径、目标和账户换成实际值后，运行 `ssh vpn-server`；目标 SSH 仍使用自己的密钥和 `known_hosts`。助手脚本要求凭证文件属于当前用户，且组和其他用户没有任何权限。
 
 ## 构建、上游锁定与发布
 
@@ -195,7 +222,7 @@ GitHub Actions 的边界如下：
 2. **状态为 `needs_attention`**：修正网关、账户、密码或 TOTP 后执行 `python3 manage.py restart`。达到 `LOGIN_FAILURE_LIMIT` 后服务会停止继续提交错误登录。
 3. **health 不通过**：执行 `python3 manage.py check`。它同时检查目标是否由 TUN 路由，以及 SOCKS 到目标的真实 TCP 连接。确认 `HEALTHCHECK_HOST` 和 `HEALTHCHECK_PORT` 是经 VPN 可达的目标与端口。
 4. **IP 可达但域名失败**：检查 `VPN_DNS` 是否是经 TUN 可达的 DNS。运行期不会使用 Docker DNS 或公网 DNS 回退。
-5. **SOCKS 代理连接失败**：检查客户端的 `SOCKS_USERNAME`、`SOCKS_PASSWORD` 是否与服务端一致，并用 `python3 manage.py status` 确认代理已 healthy。匿名访问会被拒绝；curl 示例见快速开始。远程客户端应通过 SSH 通道接入服务器回环端口。
+5. **SOCKS 代理连接失败**：检查客户端的 `SOCKS_USERNAME`、`SOCKS_PASSWORD` 是否与服务端一致，并用 `python3 manage.py status` 确认代理已 healthy。匿名访问会被拒绝；curl 示例适用于回环非 TLS 模式。公网 TLS 接入检查证书信任、SAN、有效期、`SOCKS_BIND`、主机防火墙和云安全组；使用 `--ssh` 时检查代理服务器的 SSH 别名。
 6. **需要查看桌面**：临时设置 `DEBUG_DESKTOP=1` 并执行 `restart`，访问 `http://127.0.0.1:6080/vnc.html?autoconnect=1`；完成后恢复为 `0` 并再次重启。
 
 提交 Issue 或日志片段前，请删除账户、密码、TOTP、网关凭证、内网地址和主机指纹。

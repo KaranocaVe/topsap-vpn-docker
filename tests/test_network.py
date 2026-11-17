@@ -2,16 +2,39 @@ from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 from pathlib import Path
 import socket
+import ssl
 import struct
 import sys
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
 import network
 
 
 class SocksConnectTests(unittest.TestCase):
+    def test_tls_probe_verifies_certificate_before_sending_credentials(self):
+        transport = MagicMock()
+        context = Mock()
+        context.wrap_socket.side_effect = ssl.SSLCertVerificationError('untrusted fixture')
+        with patch.object(network.socket, 'create_connection', return_value=transport), \
+                patch.object(network.ssl, 'create_default_context', return_value=context) as factory, \
+                patch.object(network, 'socks_connect') as connect:
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                network.probe('10.0.0.10', 22, username='alice', password='secret',
+                              tls_ca='/test/cert.pem', tls_server_name='proxy.example.com')
+        factory.assert_called_once_with(cafile='/test/cert.pem')
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+        self.assertEqual(context.wrap_socket.call_args.kwargs['server_hostname'], 'proxy.example.com')
+        connect.assert_not_called()
+
+    def test_tls_probe_options_preserve_plain_loopback_mode(self):
+        self.assertEqual(network.tls_probe_options({}), {})
+        self.assertEqual(network.tls_probe_options({'SOCKS_TLS': '1',
+                                                   'SOCKS_TLS_SERVER_NAME': 'proxy.example.com'}),
+                         {'tls_ca': '/run/secrets/socks-tls.crt',
+                          'tls_server_name': 'proxy.example.com'})
+
     def test_destination_port_must_be_nonzero(self):
         class Socket:
             def sendall(self, data):
@@ -155,6 +178,25 @@ class SocksConnectTests(unittest.TestCase):
                        '127.0.0.1', '-p', 'tcp', '--dport', '1081', '-j', 'ACCEPT'), calls)
         self.assertNotIn(('ip6tables', '-w', '-A', 'TOPSAP_PROXY', '-o', 'lo', '-d',
                           '127.0.0.1', '-p', 'tcp', '--dport', '1081', '-j', 'ACCEPT'), calls)
+        self.assertIn(('iptables', '-w', '-A', 'TOPSAP_INPUT', '-j', 'REJECT'), calls)
+
+    def test_tls_frontend_accepts_external_clients_without_opening_backend(self):
+        calls = []
+
+        def command(*args):
+            calls.append(args)
+            if args == ('ip', '-j', 'route', 'show', 'default'):
+                return '[{"gateway":"192.0.2.1"}]'
+            return ''
+
+        with patch.object(network, 'command', side_effect=command), \
+                patch.object(network.subprocess, 'run', return_value=Mock(returncode=1)):
+            network.install_firewall(tls=True)
+        for tool in ('iptables', 'ip6tables'):
+            self.assertIn((tool, '-w', '-A', 'TOPSAP_INPUT', '-j', 'ACCEPT'), calls)
+            self.assertIn((tool, '-w', '-I', 'INPUT', '-p', 'tcp', '--dport', '1080',
+                           '-j', 'TOPSAP_INPUT'), calls)
+        self.assertNotIn(('iptables', '-w', '-A', 'TOPSAP_PROXY', '-o', 'eth0', '-j', 'ACCEPT'), calls)
 
 
 if __name__ == '__main__':

@@ -4,7 +4,7 @@ import sys
 import time
 
 from config import settings
-from network import probe, tunnel_for
+from network import probe, tls_probe_options, tunnel_for
 
 
 def check():
@@ -15,7 +15,8 @@ def check():
     if not tunnel_for(config['HEALTHCHECK_HOST']):
         raise RuntimeError('Health target is not routed through TUN')
     probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'],
-          username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'])
+          username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'],
+          **tls_probe_options(config))
 
 
 if __name__ == '__main__':

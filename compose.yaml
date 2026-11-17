@@ -30,7 +30,10 @@ services:
         bind:
           create_host_path: false
     ports:
-      - "127.0.0.1:${SOCKS_PORT:-1080}:1080"
+      - target: 1080
+        published: "${SOCKS_PORT:-1080}"
+        host_ip: "${SOCKS_BIND:-127.0.0.1}"
+        protocol: tcp
     healthcheck:
       test: [CMD, python3, /usr/local/lib/topsap-service/healthcheck.py]
       interval: 15s

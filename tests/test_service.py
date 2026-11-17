@@ -6,7 +6,7 @@ import socket
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
 import config
@@ -18,6 +18,25 @@ import manage
 
 
 class ServiceTests(unittest.TestCase):
+    def test_tls_key_is_passed_to_unprivileged_frontend_only_through_stdin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cert, key = Path(directory) / 'cert.pem', Path(directory) / 'key.pem'
+            cert.write_text('fixture-certificate')
+            key.write_text('fixture-private-key')
+            process = Mock()
+            with patch.object(service, 'TLS_CERT', cert), patch.object(service, 'TLS_KEY', key), \
+                    patch.object(service, 'launch', return_value=process) as launch:
+                service.start_auth_proxy({'SOCKS_USERNAME': 'alice', 'SOCKS_PASSWORD': 'secret',
+                                          'SOCKS_TLS': '1'}, {})
+            self.assertEqual(json.loads(process.stdin.write.call_args.args[0]),
+                             ['alice', 'secret', {'cert': 'fixture-certificate',
+                                                  'key': 'fixture-private-key'}])
+            process.stdin.close.assert_called_once()
+            self.assertNotIn('fixture-private-key', repr(launch.call_args))
+            self.assertEqual(launch.call_args.args[0][:5],
+                             ['setpriv', '--reuid=65534', '--regid=65534',
+                              '--clear-groups', '--no-new-privs'])
+
     def test_backend_not_ready_when_paths_are_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
