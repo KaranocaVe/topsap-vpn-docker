@@ -28,9 +28,16 @@ def read_env(path):
 def settings():
     values = read_env(os.environ.get('TOPSAP_ENV_FILE', '/run/secrets/topsap.env'))
     for key in ('VPN_HOST', 'VPN_ACCOUNT', 'VPN_PASSWD', 'VPN_TOTP_SECRET',
-                'VPN_DNS', 'HEALTHCHECK_HOST'):
+                'VPN_DNS', 'HEALTHCHECK_HOST', 'SOCKS_USERNAME', 'SOCKS_PASSWORD'):
         if not values.get(key):
             raise ValueError(f'Missing .env setting: {key}')
+    for key in ('SOCKS_USERNAME', 'SOCKS_PASSWORD'):
+        try:
+            encoded = values[key].encode('utf-8')
+        except UnicodeEncodeError:
+            raise ValueError(f'Invalid .env setting: {key}') from None
+        if b'\0' in encoded or not 1 <= len(encoded) <= 255:
+            raise ValueError(f'Invalid .env setting: {key}')
     for key in ('VPN_DNS', 'HEALTHCHECK_HOST'):
         ipaddress.ip_address(values[key])
     for key, default, low, high in (('HEALTHCHECK_PORT', '443', 1, 65535),

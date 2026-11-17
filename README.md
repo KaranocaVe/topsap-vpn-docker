@@ -22,15 +22,17 @@ TOPSAP_IMAGE='ghcr.io/karanocave/topsap-vpn-docker:3.6.3.32.2.22375'
 
 ```text
 本机应用（curl、浏览器、客户端）
-        │ SOCKS5
+        │ SOCKS5 用户名/密码鉴权
         ▼
-127.0.0.1:1080 → MicroSocks（UID 65534）→ tun0 → 内网 TCP 目标
-                                      │
-                                      └─ supervisor → TopSAP 后端、Xvfb/Electron、VPN 登录和 TOTP
+127.0.0.1:1080 → 鉴权前端 → MicroSocks（容器内 127.0.0.1:1081）→ tun0 → 内网 TCP 目标
+                UID 65534   UID 65534
+
+supervisor → TopSAP 后端、Xvfb/Electron、VPN 登录和 TOTP
 ```
 
 - 容器内负责 TopSAP、TUN、路由、DNS 和 SOCKS5；宿主机不安装 TopSAP。
-- 代理只发布到宿主机回环地址。防火墙限制代理新建连接只能走 TUN，隧道消失时不会回落到普通出口。
+- 代理只发布到宿主机回环地址，每条连接都必须鉴权，不提供匿名或按 IP 豁免模式。supervisor 从 secret 读取配置，仅将代理凭证经管道传给 UID 65534 的鉴权前端；MicroSocks 只监听容器内回环地址。
+- 防火墙仅允许代理连接容器内的 MicroSocks 或经 TUN 访问目标；隧道消失时不会回落到普通出口。
 - root 文件系统只读；运行时的厂商文件、配置和浏览器 profile 放在 tmpfs。宿主机只绑定一个用于切换 bootstrap DNS/VPN DNS 的 resolver 文件。
 - 没有 host network、特权容器、Docker socket 或宿主家目录挂载。厂商后端仍以容器 root 运行并需要 `NET_ADMIN`，因此防火墙不构成对已被攻破的容器 root 的安全边界。
 - supervisor 检查必需进程、TUN 路由和真实 SOCKS 连接；失败时清理进程组和 TUN，并以 10–120 秒退避重新登录。连续登录失败达到限制后进入 `needs_attention`，需要人工修正配置并重启。
@@ -44,13 +46,13 @@ git clone https://github.com/KaranocaVe/topsap-vpn-docker.git
 cd topsap-vpn-docker
 cp .env.example .env
 chmod 600 .env
-# 编辑 .env，至少填写 VPN_HOST、VPN_ACCOUNT、VPN_PASSWD、VPN_TOTP_SECRET、VPN_DNS、HEALTHCHECK_HOST、HEALTHCHECK_PORT
+# 编辑 .env，填写 VPN_*、SOCKS_USERNAME、SOCKS_PASSWORD 和 HEALTHCHECK_*；密码使用随机值
 $EDITOR .env
 
 ./start.sh                         # 使用 GHCR latest；创建 resolver 并等待 healthy
 ```
 
-示例配置使用 `vpn.example.com`；健康检查目标必须替换成管理员提供且经 VPN 可达的 TCP 主机和端口，其中 `HEALTHCHECK_HOST` 使用目标 IP，`HEALTHCHECK_PORT` 使用目标 TCP 端口。DNS 示例与 `.env.example` 保持为 `10.0.0.53`。这些值都必须替换成适合当前网络的值。`VPN_TOTP_SECRET` 是已绑定认证器的 Base32 密钥；实现固定使用 SHA1、6 位、30 秒周期。`.env` 是数据文件，不会被 shell `source`，不支持变量插值或命令执行；不要提交真实 `.env`。
+示例配置使用 `vpn.example.com`；健康检查目标必须替换成管理员提供且经 VPN 可达的 TCP 主机和端口，其中 `HEALTHCHECK_HOST` 使用目标 IP，`HEALTHCHECK_PORT` 使用目标 TCP 端口。DNS 示例与 `.env.example` 保持为 `10.0.0.53`。这些值都必须替换成适合当前网络的值。`VPN_TOTP_SECRET` 是已绑定认证器的 Base32 密钥；实现固定使用 SHA1、6 位、30 秒周期。`SOCKS_USERNAME` 和 `SOCKS_PASSWORD` 必填，各为 1–255 个 UTF-8 字节；建议密码用 Python `secrets.token_urlsafe(32)` 生成。缺少鉴权配置时服务会拒绝启动。`.env` 是数据文件，不会被 shell `source`，不支持变量插值或命令执行；不要提交真实 `.env`。
 
 启动前 `start.sh` 会创建 `runtime/resolv.conf`。服务启动后会等待 Docker healthcheck 通过；若超时，先看日志：
 
@@ -63,10 +65,10 @@ python3 manage.py logs
 服务 healthy 后，可直接让支持 SOCKS5 的客户端使用回环端口。例如：
 
 ```sh
-curl --socks5-hostname 127.0.0.1:1080 https://target.example/
+curl --socks5-hostname 127.0.0.1:1080 --proxy-user your-proxy-user https://target.example/
 ```
 
-将 `target.example` 换成经 VPN 可达的目标；`--socks5-hostname` 会让目标域名通过 SOCKS5 解析。
+将 `target.example` 换成经 VPN 可达的目标，用户名与 `.env` 保持一致；curl 会提示输入代理密码。`--socks5-hostname` 会让目标域名通过 SOCKS5 解析。健康检查也使用相同凭证进行真实连接测试。
 
 本地源码构建：
 
@@ -75,6 +77,10 @@ curl --socks5-hostname 127.0.0.1:1080 https://target.example/
 # 或
 python3 manage.py build
 ```
+
+## 从无鉴权版本升级
+
+更新前，先在现有 `.env` 中加入独立的 `SOCKS_USERNAME` 和随机 `SOCKS_PASSWORD`，并同步修改客户端凭证；旧的匿名 SOCKS5 客户端将无法连接。缺少任一项时，新镜像会拒绝启动。保留原有 VPN 配置，完成后执行 `python3 manage.py update`；若使用固定镜像标签，先把 `TOPSAP_IMAGE` 改为要部署的新标签或 digest。
 
 ## 配置
 
@@ -91,6 +97,7 @@ python3 manage.py build
 | `LOGIN_TIMEOUT` | `120` | 单次登录等待隧道的秒数。 |
 | `LOGIN_FAILURE_LIMIT` | `3` | 连续登录失败（含页面、网络和隧道超时）后停止尝试并进入 `needs_attention`。 |
 | `SOCKS_PORT` | `1080` | 仅绑定宿主机 `127.0.0.1`。 |
+| `SOCKS_USERNAME` / `SOCKS_PASSWORD` | — | 每条 SOCKS5 连接都必须提供的独立凭证；各为 1–255 个 UTF-8 字节，不允许 NUL。与 VPN 账号密码分开设置。 |
 | `HEALTHCHECK_HOST` / `HEALTHCHECK_PORT` | `10.0.0.10` / `443` | 必须经 VPN 到达的通用 TCP 探测目标；只检查 TCP 连接，不依赖特定协议或服务 banner。将主机替换为管理员提供的目标 IP。 |
 | `DEBUG_DESKTOP` | `0` | 设为 `1` 后临时发布回环地址上的 noVNC `6080`，只用于排障。入口无额外认证，用完改回 `0` 并重启。 |
 
@@ -116,16 +123,29 @@ python3 manage.py build
 
 ## 客户端示例
 
-容器只提供 SOCKS5 代理，不生成客户端配置。需要通过 SSH 访问 VPN 内网目标时，可手工在自己的 `~/.ssh/config` 中加入以下片段：
+`scripts/socks_connect.py` 可直接用作 OpenSSH 的 `ProxyCommand`，从文件读取代理凭证，不把密码放进 SSH 命令行。先创建权限为 `0600` 的 `~/.ssh/topsap-socks.env`，只写入与服务端一致的两项：
+
+```dotenv
+SOCKS_USERNAME='your-proxy-user'
+SOCKS_PASSWORD='your-random-proxy-password'
+```
+
+代理在本机时，可在 `~/.ssh/config` 中加入：
 
 ```sshconfig
 Host vpn-server
     HostName 10.0.0.10
     User your-user
-    ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+    ProxyCommand python3 /absolute/path/topsap-vpn-docker/scripts/socks_connect.py --credentials ~/.ssh/topsap-socks.env %h %p
 ```
 
-将 `vpn-server`、`10.0.0.10` 和 `your-user` 换成自己的目标与账户后，运行 `ssh vpn-server`。SSH 沿用本机密钥与 `known_hosts`。Linux 和 macOS 的 `nc` 参数可能不同，请先用 `nc -h` 确认本机实现支持 `-X 5` 与 `-x`。
+代理部署在远程服务器时，先为该服务器配置可用的 SSH 别名，例如 `proxy-host`，再把 `ProxyCommand` 改为：
+
+```sshconfig
+    ProxyCommand python3 /absolute/path/topsap-vpn-docker/scripts/socks_connect.py --credentials ~/.ssh/topsap-socks.env --ssh proxy-host %h %p
+```
+
+`--ssh` 通过该服务器的 SSH 通道连接其 `127.0.0.1:1080`，不需要在公网开放代理端口，也不需要另开一个常驻转发进程。SOCKS5 用户名密码协议本身不加密，跨机器使用时应保留这一加密通道。将示例路径、目标和账户换成实际值后，运行 `ssh vpn-server`；目标 SSH 仍使用自己的密钥和 `known_hosts`。助手脚本要求凭证文件属于当前用户，且组和其他用户没有任何权限。
 
 ## 构建、上游锁定与发布
 
@@ -175,7 +195,7 @@ GitHub Actions 的边界如下：
 2. **状态为 `needs_attention`**：修正网关、账户、密码或 TOTP 后执行 `python3 manage.py restart`。达到 `LOGIN_FAILURE_LIMIT` 后服务会停止继续提交错误登录。
 3. **health 不通过**：执行 `python3 manage.py check`。它同时检查目标是否由 TUN 路由，以及 SOCKS 到目标的真实 TCP 连接。确认 `HEALTHCHECK_HOST` 和 `HEALTHCHECK_PORT` 是经 VPN 可达的目标与端口。
 4. **IP 可达但域名失败**：检查 `VPN_DNS` 是否是经 TUN 可达的 DNS。运行期不会使用 Docker DNS 或公网 DNS 回退。
-5. **SOCKS 代理连接失败**：检查客户端是否连接 `127.0.0.1:1080`，并用 `python3 manage.py status` 确认代理已 healthy；支持 SOCKS5 的客户端可用 `curl --socks5-hostname 127.0.0.1:1080 https://target.example/` 验证。
+5. **SOCKS 代理连接失败**：检查客户端的 `SOCKS_USERNAME`、`SOCKS_PASSWORD` 是否与服务端一致，并用 `python3 manage.py status` 确认代理已 healthy。匿名访问会被拒绝；curl 示例见快速开始。远程客户端应通过 SSH 通道接入服务器回环端口。
 6. **需要查看桌面**：临时设置 `DEBUG_DESKTOP=1` 并执行 `restart`，访问 `http://127.0.0.1:6080/vnc.html?autoconnect=1`；完成后恢复为 `0` 并再次重启。
 
 提交 Issue 或日志片段前，请删除账户、密码、TOTP、网关凭证、内网地址和主机指纹。

@@ -14,7 +14,8 @@ def check():
     config = settings()
     if not tunnel_for(config['HEALTHCHECK_HOST']):
         raise RuntimeError('Health target is not routed through TUN')
-    probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'])
+    probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'],
+          username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'])
 
 
 if __name__ == '__main__':

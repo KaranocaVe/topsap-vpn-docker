@@ -31,21 +31,84 @@ def exact(sock, size):
     return data
 
 
-def probe(host, port, proxy_host='127.0.0.1', proxy_port=1080):
-    address = ipaddress.ip_address(host)
+def _credential_bytes(value):
+    if not isinstance(value, str):
+        raise ValueError('Invalid SOCKS credential')
+    try:
+        encoded = value.encode('utf-8')
+    except UnicodeEncodeError:
+        raise ValueError('Invalid SOCKS credential') from None
+    if b'\0' in encoded or not 1 <= len(encoded) <= 255:
+        raise ValueError('Invalid SOCKS credential')
+    return encoded
+
+
+def socks_connect(sock, host, port, *, username=None, password=None):
+    if (username is None) != (password is None):
+        raise ValueError('SOCKS username and password must be provided together')
+    if username is None:
+        methods = b'\x00'
+        credentials = None
+    else:
+        credentials = (_credential_bytes(username), _credential_bytes(password))
+        methods = b'\x02'
+
+    sock.sendall(b'\x05' + bytes([len(methods)]) + methods)
+    negotiation = exact(sock, 2)
+    expected_method = methods[0]
+    if negotiation[0] != 5 or negotiation[1] != expected_method:
+        raise ConnectionError('SOCKS authentication negotiation failed')
+
+    if credentials is not None:
+        user, secret = credentials
+        sock.sendall(b'\x01' + bytes([len(user)]) + user
+                     + bytes([len(secret)]) + secret)
+        auth_reply = exact(sock, 2)
+        if auth_reply[0] != 1 or auth_reply[1] != 0:
+            raise ConnectionError('SOCKS username/password authentication failed')
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            address = host.encode('idna')
+        except (AttributeError, UnicodeError):
+            raise ValueError('Invalid SOCKS destination host') from None
+        if not address or len(address) > 255 or b'\0' in address:
+            raise ValueError('Invalid SOCKS destination host')
+        atyp = b'\x03'
+        encoded_address = bytes([len(address)]) + address
+    else:
+        atyp = b'\x01' if address.version == 4 else b'\x04'
+        encoded_address = address.packed
+
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError('Invalid SOCKS destination port')
+    sock.sendall(b'\x05\x01\x00' + atyp + encoded_address + struct.pack('>H', port))
+
+    reply = exact(sock, 4)
+    if reply[0] != 5:
+        raise ConnectionError('Invalid SOCKS connect reply version')
+    if reply[2] != 0:
+        raise ConnectionError('Invalid SOCKS connect reply reserved field')
+    if reply[3] == 1:
+        size = 4
+    elif reply[3] == 4:
+        size = 16
+    elif reply[3] == 3:
+        size = exact(sock, 1)[0]
+        if not size:
+            raise ConnectionError('Invalid SOCKS connect reply address')
+    else:
+        raise ConnectionError('Invalid SOCKS connect reply address type')
+    exact(sock, size + 2)
+    if reply[1] != 0:
+        raise ConnectionError('SOCKS destination connection failed')
+
+
+def probe(host, port, proxy_host='127.0.0.1', proxy_port=1080, *, username=None, password=None):
     with socket.create_connection((proxy_host, proxy_port), timeout=5) as sock:
-        sock.sendall(b'\x05\x01\x00')
-        if exact(sock, 2) != b'\x05\x00':
-            raise ConnectionError('SOCKS authentication negotiation failed')
-        sock.sendall(b'\x05\x01\x00' + bytes([1 if address.version == 4 else 4])
-                     + address.packed + struct.pack('>H', port))
-        reply = exact(sock, 4)
-        if reply[:2] != b'\x05\x00':
-            raise ConnectionError('SOCKS destination connection failed')
-        size = {1: 4, 4: 16}.get(reply[3])
-        if size is None:
-            size = exact(sock, 1)[0]
-        exact(sock, size + 2)
+        socks_connect(sock, host, port, username=username, password=password)
 
 
 def install_firewall():
@@ -56,6 +119,9 @@ def install_firewall():
         command(tool, '-w', '-F', 'TOPSAP_PROXY')
         command(tool, '-w', '-A', 'TOPSAP_PROXY', '-m', 'conntrack',
                 '--ctstate', 'ESTABLISHED', '--ctdir', 'REPLY', '-j', 'ACCEPT')
+        if tool == 'iptables':
+            command(tool, '-w', '-A', 'TOPSAP_PROXY', '-o', 'lo', '-d', '127.0.0.1',
+                    '-p', 'tcp', '--dport', '1081', '-j', 'ACCEPT')
         command(tool, '-w', '-A', 'TOPSAP_PROXY', '-o', 'tun+', '-j', 'ACCEPT')
         command(tool, '-w', '-A', 'TOPSAP_PROXY', '-j', 'REJECT')
         rule = ['OUTPUT', '-m', 'owner', '--uid-owner', '65534', '-j', 'TOPSAP_PROXY']

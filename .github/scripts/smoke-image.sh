@@ -18,7 +18,7 @@ docker run --rm -i --network none --entrypoint /bin/sh "$image" -eu <<'CONTAINER
   python3 - <<"PY"
 import importlib
 
-for name in ("common", "config", "healthcheck", "network", "otp", "service", "vpn_login"):
+for name in ("auth_proxy", "common", "config", "healthcheck", "network", "otp", "service", "vpn_login"):
     importlib.import_module(name)
 PY
 

@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import pathlib
@@ -13,6 +14,8 @@ from network import command, gateway_firewall, install_firewall, probe, tunnel_f
 APP = pathlib.Path('/opt/apps/cn.com.topvpn/files')
 RUNTIME = pathlib.Path('/run/topsap')
 PROGRAMS = pathlib.Path(__file__).parent
+BACKEND_SOCKET = pathlib.Path('/tmp/TopSAP_ELE/topsap.sock')
+LEGACY_BACKEND_MARKER = pathlib.Path('/tmp/TopSAP_ELE/.BUFF')
 STOPPING = False
 
 
@@ -77,6 +80,28 @@ def wait_until(predicate, timeout, processes):
     raise RuntimeError('VPN startup interrupted or timed out')
 
 
+def backend_ready():
+    return BACKEND_SOCKET.is_socket() or LEGACY_BACKEND_MARKER.is_dir()
+
+
+def start_auth_proxy(config, devnull):
+    process = launch(['setpriv', '--reuid=65534', '--regid=65534', '--clear-groups',
+                      '--no-new-privs', sys.executable, str(PROGRAMS / 'auth_proxy.py')],
+                     stdin=subprocess.PIPE, **devnull)
+    try:
+        payload = json.dumps([config['SOCKS_USERNAME'], config['SOCKS_PASSWORD']],
+                             ensure_ascii=False).encode('utf-8') + b'\n'
+        process.stdin.write(payload)
+        process.stdin.close()
+    except Exception:
+        with contextlib.suppress(Exception):
+            process.stdin.close()
+        with contextlib.suppress(Exception):
+            terminate([process])
+        raise
+    return process
+
+
 def prepare(original_resolver):
     pathlib.Path('/etc/resolv.conf').write_text(original_resolver)
     for path in (pathlib.Path('/opt/apps/cn.com.topvpn'),
@@ -112,7 +137,7 @@ def run_cycle(config, original_resolver, on_ready):
         backend_env = dict(os.environ, LD_LIBRARY_PATH=str(APP))
         backend = launch([str(APP / 'sv_websrv')], cwd=APP, env=backend_env, **devnull)
         processes.append(backend)
-        wait_until(lambda: pathlib.Path('/tmp/TopSAP_ELE/.BUFF').is_dir(), 15, processes)
+        wait_until(backend_ready, 15, processes)
         xvfb = launch(['Xvfb', ':0', '-screen', '0', '1280x800x24', '-nolisten', 'tcp', '-noreset'], **devnull)
         processes.append(xvfb)
         wait_until(lambda: pathlib.Path('/tmp/.X11-unix/X0').exists(), 10, processes)
@@ -136,12 +161,15 @@ def run_cycle(config, original_resolver, on_ready):
                    and tunnel_for(config['VPN_DNS']) is not None, 30, processes)
         vpn_resolver(config)
         proxy = launch(['setpriv', '--reuid=65534', '--regid=65534', '--clear-groups',
-                        '--no-new-privs',
-                        'microsocks', '-i', '0.0.0.0', '-p', '1080'], **devnull)
+                        '--no-new-privs', 'microsocks', '-i', '127.0.0.1', '-p', '1081'], **devnull)
         processes.append(proxy)
         wait_until(lambda: proxy.poll() is None, 2, processes)
+        auth_proxy = start_auth_proxy(config, devnull)
+        processes.append(auth_proxy)
+        wait_until(lambda: auth_proxy.poll() is None, 2, processes)
         sleep(0.5)
-        probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'])
+        probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'],
+              username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'])
         status('ready', interface=tunnel_for(config['HEALTHCHECK_HOST']))
         on_ready()
         log('VPN ready; SOCKS5 listening on port 1080 with TUN-only outbound access.')
@@ -153,7 +181,8 @@ def run_cycle(config, original_resolver, on_ready):
                 vpn_resolver(config)
                 if not tunnel_for(config['HEALTHCHECK_HOST']):
                     raise RuntimeError('TUN route disappeared')
-                probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'])
+                probe(config['HEALTHCHECK_HOST'], config['HEALTHCHECK_PORT'],
+                      username=config['SOCKS_USERNAME'], password=config['SOCKS_PASSWORD'])
                 failures = 0
                 status('ready', interface=tunnel_for(config['HEALTHCHECK_HOST']))
             except Exception:
