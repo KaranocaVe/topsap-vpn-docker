@@ -3,11 +3,14 @@ import io
 import os
 from pathlib import Path
 import select
+import signal
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -225,6 +228,62 @@ class SocksClientTests(unittest.TestCase):
         self.assertIn('ControlPersist=no', command)
         self.assertEqual(command[-3:], ['-W', '[2001:db8::5]:1080', 'proxy-host'])
         self.assertNotIn('secret-value', ' '.join(command))
+
+    def test_proxycommand_termination_is_quiet_and_reaps_ssh_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials = self.credentials(directory)
+            ready, stopped = root / 'ready', root / 'stopped'
+            ssh = root / 'ssh'
+            ssh.write_text(f'#!{sys.executable}\n' + '''import os, sys
+from pathlib import Path
+def exact(size):
+    data = sys.stdin.buffer.read(size)
+    if len(data) != size:
+        raise SystemExit(2)
+    return data
+def reply(data):
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+assert exact(3) == b'\\x05\\x01\\x02'
+reply(b'\\x05\\x02')
+version, size = exact(2)
+assert version == 1
+exact(size)
+exact(exact(1)[0])
+reply(b'\\x01\\x00')
+assert exact(4) == b'\\x05\\x01\\x00\\x03'
+exact(exact(1)[0] + 2)
+reply(b'\\x05\\x00\\x00\\x01\\x7f\\x00\\x00\\x01\\x00\\x50')
+''' + f'Path({str(ready)!r}).write_text(str(os.getpid()))\n'
+                + 'sys.stdin.buffer.read()\n'
+                + f'Path({str(stopped)!r}).touch()\n')
+            ssh.chmod(0o700)
+            process = subprocess.Popen(
+                [sys.executable, str(ROOT / 'scripts' / 'socks_connect.py'),
+                 '--credentials', str(credentials), '--ssh', 'proxy-host',
+                 'service.example', '443'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                         PYTHONDONTWRITEBYTECODE='1'), start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), 'SSH fixture did not reach the relay phase')
+                child_pid = int(ready.read_text())
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 128 + signal.SIGTERM)
+                self.assertEqual(stdout, b'')
+                self.assertEqual(stderr, b'')
+                self.assertTrue(stopped.exists(), 'SSH child did not receive EOF during cleanup')
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
 
     def test_ssh_tunnel_auth_failure_closes_and_reaps_child(self):
         server_errors = []

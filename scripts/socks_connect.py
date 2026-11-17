@@ -261,7 +261,9 @@ def _install_cleanup_signals():
     previous = {}
 
     def interrupt(signum, frame):
-        raise InterruptedError
+        # OpenSSH terminates ProxyCommand after a normal session exit too.
+        # Unwind through run()'s cleanup without reporting a connection failure.
+        raise SystemExit(128 + signum)
 
     for name in ('SIGTERM', 'SIGHUP'):
         value = getattr(signal, name, None)
