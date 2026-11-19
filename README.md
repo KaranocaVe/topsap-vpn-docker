@@ -196,7 +196,7 @@ python3 manage.py build
 
 `update` 会重新读取官网目录、分别下载并计算 `amd64`/`arm64` 的 SHA256；拒绝版本回退，并省略时间戳以避免无内容变化的每日提交。锁文件应和源码一起审阅。
 
-GitHub Actions 在直连官网超时后，会从 GeoNode 和 Proxifly 的公开中国代理列表中筛选 HTTP CONNECT 出口。所有官网连接仍验证 HTTPS 证书和官方域名，锁定构建仍逐字节校验 SHA256；代理不进入运行镜像，也不接触用户的 VPN、TOTP 或其他运行时凭证。下载中断或哈希不符会丢弃临时文件并切换出口，全部失败则终止任务。公开代理随时可能失效，流程无法保证每日都能取得可用出口。
+GitHub Actions 在直连官网失败后，从 GeoNode、Proxifly、ProxyScrape、openproxylist 和 FREE_PROXIES_LIST 中筛选 HTTP CONNECT 出口。每次下载最多使用 4 条代理线路，取第一份完整且通过校验的响应，随后取消其余下载并清理临时文件。所有官网连接都验证 HTTPS 证书和官方域名，锁定构建校验文件大小和 SHA256。代理只用于构建和锁文件更新。
 
 本地构建默认直连；需要相同备用机制时可运行：
 
