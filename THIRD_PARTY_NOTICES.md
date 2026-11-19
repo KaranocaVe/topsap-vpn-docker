@@ -8,6 +8,7 @@
 - **用途**：容器内的厂商 VPN 客户端、后端和 Electron 文件。
 - **权利**：TopSAP 是厂商专有软件，相关版权、商标和使用条件归 Topsec 或其许可方所有。它没有因为本仓库或 GHCR 镜像使用 MIT 而变成开源软件。
 - **下载方式**：构建读取提交的 `packages.lock.json`，只从上述官方域名下载对应 `amd64`/`arm64` 包，校验 URL、版本、架构、大小和 SHA256 后提取 payload；仓库不提交 vendor 安装包。
+- **代理目录**：直连失败时，构建可使用 [GeoNode](https://geonode.com/)、[Proxifly](https://github.com/proxifly/free-proxy-list)、[ProxyScrape](https://proxyscrape.com/)、[openproxylist](https://github.com/roosterkid/openproxylist) 和 [FREE_PROXIES_LIST](https://github.com/Zaeem20/FREE_PROXIES_LIST) 查找 HTTP CONNECT 出口。安装包仍由 Topsec 官方站点通过 HTTPS 提供。
 - **再分发**：公开项目和公开镜像不构成 TopSAP 的再授权或官方背书。使用者必须自行确认账户、下载、部署和组织内分发符合厂商条款。
 
 ## Debian 和 Alpine

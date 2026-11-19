@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Discover official TopSAP DEBs and fetch SHA256-locked build inputs."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 import hashlib
 from http.client import HTTPException
 from html.parser import HTMLParser
@@ -9,8 +11,9 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from threading import Event, Lock
 import time
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import unquote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -37,51 +40,98 @@ class OfficialRedirects(HTTPRedirectHandler):
 
 OPENER = build_opener(OfficialRedirects())
 PUBLIC_PROXY = False
-PROXY_OPENERS = None
-PROXY_INDEX = 0
+PROXY_WORKERS = 16
 
 
 class PackageMismatch(ValueError):
     pass
 
 
-def network_openers():
-    global PROXY_OPENERS
-    if not PUBLIC_PROXY:
-        return [OPENER]
-    if PROXY_OPENERS is None:
-        try:
-            with OPENER.open(Request(SOURCE, method='HEAD'), timeout=8):
-                pass
-            PROXY_OPENERS = [OPENER]
-        except (OSError, HTTPException):
-            # Only official public downloads use these untrusted transports.
-            # TLS validation and OfficialRedirects remain enabled end to end.
-            from public_proxy import find_proxies
-            PROXY_OPENERS = [build_opener(ProxyHandler({'https': proxy}), OfficialRedirects())
-                             for proxy in find_proxies()]
-    return PROXY_OPENERS
-
-
-def rotate_proxy():
-    global PROXY_INDEX
-    PROXY_INDEX += 1
-
-
-def open_url(url):
+def open_url(url, proxy):
     request = Request(official_url(url), headers={'User-Agent': 'topsap-vpn-docker/1.0'})
-    openers = network_openers()
-    for attempt in range(3):
+    if proxy is None:
+        return OPENER.open(request, timeout=8 if PUBLIC_PROXY else 30)
+    opener = build_opener(ProxyHandler({'https': proxy}), OfficialRedirects())
+    return opener.open(request, timeout=12)
+
+
+@lru_cache(maxsize=1)
+def proxy_candidates():
+    from public_proxy import candidates, find_proxies
+    verified = find_proxies()
+    # Catalog probes identify working CONNECT routes, but a large package can
+    # expose different throughput and timeout behavior. Race all candidates
+    # while putting verified routes first.
+    return list(dict.fromkeys(verified + candidates()))
+
+
+def race_proxies(transfer, proxies):
+    stop = Event()
+    finish = Lock()
+    error = None
+
+    def attempt(proxy):
+        result = transfer(proxy, stop)
+        with finish:
+            if stop.is_set():
+                raise OSError('Download cancelled')
+            stop.set()
+        return result
+
+    with ThreadPoolExecutor(max_workers=PROXY_WORKERS) as pool:
+        futures = [pool.submit(attempt, proxy) for proxy in proxies]
         try:
-            return openers[PROXY_INDEX % len(openers)].open(request, timeout=30)
-        except HTTPError as error:
-            if error.code < 500 or attempt == 2:
+            for future in as_completed(futures):
+                try:
+                    return future.result()
+                except (OSError, HTTPException, ValueError) as failed:
+                    error = failed
+        finally:
+            stop.set()
+            for future in futures:
+                future.cancel()
+    raise OSError(f'All proxy downloads failed ({len(proxies)} routes): {error}') from error
+
+
+def fetch(url, transfer):
+    official_url(url)
+    for attempt in range(1 if PUBLIC_PROXY else 3):
+        try:
+            return transfer(None, Event())
+        except (OSError, HTTPException, ValueError) as error:
+            if PUBLIC_PROXY:
+                print(f'Direct download failed for {url}: {error}; trying public proxies', flush=True)
+                result = race_proxies(transfer, proxy_candidates())
+                print(f'Completed via public proxy: {url}', flush=True)
+                return result
+            if (attempt == 2 or isinstance(error, ValueError)
+                    or isinstance(error, HTTPError) and error.code < 500):
                 raise
-        except (OSError, HTTPException):
-            if attempt == 2:
-                raise
-        rotate_proxy()
-        time.sleep(2 ** attempt)
+            time.sleep(2 ** attempt)
+
+
+def response_blocks(response, stop, limit, duration):
+    if stop.is_set():
+        raise OSError('Download cancelled')
+    headers = getattr(response, 'headers', {})
+    if getattr(response, 'status', 200) != 200 or headers.get('Content-Range'):
+        raise HTTPException('Expected a complete HTTP 200 response')
+    length = headers.get('Content-Length')
+    deadline = time.monotonic() + duration
+    size = 0
+    while not stop.is_set():
+        block = response.read1(64 * 1024)
+        if time.monotonic() > deadline:
+            raise TimeoutError('Download exceeded its time limit')
+        if not block:
+            if length is not None and size != int(length):
+                raise OSError('Truncated HTTP response')
+            return
+        size += len(block)
+        if size > limit:
+            raise ValueError('Response exceeds download size limit')
+        yield block
+    raise OSError('Download cancelled')
 
 
 class Links(HTMLParser):
@@ -104,11 +154,17 @@ def links_in(html, base):
 
 
 def fetch_links(url):
-    with open_url(url) as response:
-        content = response.read(2 * 1024 * 1024 + 1)
-        if len(content) > 2 * 1024 * 1024:
-            raise ValueError('Download catalog is unexpectedly large')
-        return links_in(content.decode('utf-8-sig'), url)
+    def transfer(proxy, stop):
+        if stop.is_set():
+            raise OSError('Download cancelled')
+        with open_url(url, proxy) as response:
+            content = b''.join(response_blocks(response, stop, 2 * 1024 * 1024, 30))
+        links = links_in(content.decode('utf-8-sig'), url)
+        if not links:
+            raise ValueError('Download catalog contains no links')
+        return links
+
+    return fetch(url, transfer)
 
 
 def package_identity(url):
@@ -158,60 +214,39 @@ def read_lock(path):
     return lock
 
 
-def fetch_package_once(url, output, expected=None):
+def fetch_package(url, output, expected=None):
     target = Path(output)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        digest, size = hashlib.sha256(), 0
-        deadline = time.monotonic() + 15 * 60
-        with open_url(url) as response, tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            if (getattr(response, 'status', 200) != 200
-                    or (hasattr(response, 'headers') and response.headers.get('Content-Range'))):
-                raise HTTPException('Expected a complete HTTP 200 package response')
-            length = response.headers.get('Content-Length') if hasattr(response, 'headers') else None
-            while True:
-                block = response.read(1024 * 1024)
-                if not block:
-                    break
-                size += len(block)
-                if size > MAX_PACKAGE_BYTES:
-                    raise ValueError('Package exceeds download size limit')
-                if time.monotonic() > deadline:
-                    raise TimeoutError('Package download exceeded 15 minutes')
-                digest.update(block)
-                stream.write(block)
-        if length is not None and size != int(length):
-            raise OSError('Truncated HTTP package response')
-        result = {'sha256': digest.hexdigest(), 'size': size}
-        if not size:
-            raise ValueError('Empty package download')
-        if expected and any(result[key] != expected[key] for key in result):
-            raise PackageMismatch('Downloaded package does not match the committed lock: '
-                                  + json.dumps(result, sort_keys=True))
+    with tempfile.TemporaryDirectory(prefix='.topsap-download-', dir=target.parent) as directory:
+        def transfer(proxy, stop):
+            if stop.is_set():
+                raise OSError('Download cancelled')
+            digest, size = hashlib.sha256(), 0
+            temporary = None
+            try:
+                with (open_url(url, proxy) as response,
+                      tempfile.NamedTemporaryFile(dir=directory, delete=False) as stream):
+                    temporary = Path(stream.name)
+                    limit = expected['size'] if expected else MAX_PACKAGE_BYTES
+                    for block in response_blocks(response, stop, limit, 15 * 60):
+                        size += len(block)
+                        digest.update(block)
+                        stream.write(block)
+                result = {'sha256': digest.hexdigest(), 'size': size}
+                if not size:
+                    raise ValueError('Empty package download')
+                if expected and any(result[key] != expected[key] for key in result):
+                    raise PackageMismatch('Downloaded package does not match the committed lock: '
+                                          + json.dumps(result, sort_keys=True))
+                completed, temporary = temporary, None
+                return completed, result
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+        temporary, result = fetch(url, transfer)
         os.replace(temporary, target)
-        temporary = None
         return result
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def fetch_package(url, output, expected=None):
-    for attempt in range(3):
-        try:
-            return fetch_package_once(url, output, expected)
-        except (OSError, HTTPException):
-            if attempt == 2:
-                raise
-            rotate_proxy()
-            print('Download transport failed; retrying with another available route', flush=True)
-        except PackageMismatch:
-            if not PUBLIC_PROXY or attempt == 2:
-                raise
-            rotate_proxy()
-            print('Incomplete or mismatched package; rejecting it and trying another route', flush=True)
 
 
 def update(path):

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import patch
 
@@ -91,7 +92,7 @@ class TransportTests(unittest.TestCase):
             headers = {'Content-Length': '7', 'Content-Range': 'bytes 0-6/100'}
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'package.deb'
-            with patch.object(upstream, 'open_url', side_effect=lambda _: Partial(b'partial')):
+            with patch.object(upstream, 'open_url', side_effect=lambda *_: Partial(b'partial')):
                 with self.assertRaises(upstream.HTTPException):
                     upstream.fetch_package(upstream.SOURCE + 'package.deb', target)
             self.assertEqual(list(Path(directory).iterdir()), [])
@@ -113,36 +114,64 @@ class TransportTests(unittest.TestCase):
         import public_proxy
         raw = b'''http://127.0.0.1:80
 http://10.0.0.1:80
+http://224.0.0.1:80
 http://user:pass@8.8.8.8:80
 http://8.8.8.8:8080
+8.8.8.8:8080
+1.1.1.1:81
 http://8.8.8.8
 http://8.8.8.8:
 http://8.8.8.8:8080?token=x
 file:///tmp/x
 '''
-        with patch.object(public_proxy, 'urlopen', side_effect=[OSError(), io.BytesIO(raw)]):
-            self.assertEqual(public_proxy.candidates(), ['http://8.8.8.8:8080'])
+        with patch.object(public_proxy, 'urlopen', return_value=io.BytesIO(raw)):
+            self.assertEqual(public_proxy.source_candidates('text-list'),
+                             ['http://8.8.8.8:8080', 'http://1.1.1.1:81'])
 
     def test_proxy_json_handles_numeric_ports_and_malformed_rows(self):
         import public_proxy
         raw = json.dumps({'data': [None, {}, {'ip': '8.8.8.8', 'port': 8080},
                                    {'ip': '2001:4860:4860::8888', 'port': '8080'}]}).encode()
-        with patch.object(public_proxy, 'urlopen', side_effect=[io.BytesIO(raw), OSError()]):
-            self.assertEqual(public_proxy.candidates(),
+        with patch.object(public_proxy, 'urlopen', return_value=io.BytesIO(raw)):
+            self.assertEqual(public_proxy.source_candidates(public_proxy.GEONODE),
                              ['http://8.8.8.8:8080', 'http://[2001:4860:4860::8888]:8080'])
 
-    def test_proxy_mismatch_retries_without_accepting_invalid_bytes(self):
+    def test_proxy_race_cancels_running_download_after_first_success(self):
+        slow_started = Event()
+        slow_cancelled = Event()
+
+        def transfer(proxy, stop):
+            if proxy == 'slow':
+                slow_started.set()
+                if stop.wait(timeout=5):
+                    slow_cancelled.set()
+                raise OSError('slow route stopped')
+            self.assertTrue(slow_started.wait(timeout=5))
+            return 'complete'
+
+        self.assertEqual(upstream.race_proxies(transfer, ['slow', 'fast']), 'complete')
+        self.assertTrue(slow_cancelled.is_set())
+
+    def test_proxy_race_discards_invalid_bytes_and_preserves_existing_file_on_failure(self):
         payload = b'complete'
         expected = {'sha256': hashlib.sha256(payload).hexdigest(), 'size': len(payload)}
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'package.deb'
+            target.write_bytes(b'previous')
+
+            def open_package(url, proxy):
+                if proxy is None:
+                    raise OSError('direct route failed')
+                return io.BytesIO(payload if proxy == 'valid' else b'tampered')
+
             with patch.object(upstream, 'PUBLIC_PROXY', True), \
-                    patch.object(upstream, 'open_url', side_effect=[io.BytesIO(b'tampered'), io.BytesIO(payload)]):
-                upstream.fetch_package(upstream.SOURCE + 'package.deb', target, expected)
-            self.assertEqual(target.read_bytes(), payload)
-            with patch.object(upstream, 'PUBLIC_PROXY', True), \
-                    patch.object(upstream, 'open_url', side_effect=lambda _: io.BytesIO(b'tampered')):
-                with self.assertRaises(upstream.PackageMismatch):
+                    patch.object(upstream, 'open_url', side_effect=open_package), \
+                    patch.object(upstream, 'proxy_candidates', return_value=['invalid']) as candidates:
+                with self.assertRaisesRegex(OSError, 'All proxy downloads failed'):
                     upstream.fetch_package(upstream.SOURCE + 'package.deb', target, expected)
+                self.assertEqual(target.read_bytes(), b'previous')
+                candidates.return_value = ['invalid', 'valid']
+                self.assertEqual(upstream.fetch_package(upstream.SOURCE + 'package.deb', target, expected),
+                                 expected)
             self.assertEqual(target.read_bytes(), payload)
             self.assertEqual(list(Path(directory).iterdir()), [target])
