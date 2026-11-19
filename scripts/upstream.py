@@ -40,7 +40,7 @@ class OfficialRedirects(HTTPRedirectHandler):
 
 OPENER = build_opener(OfficialRedirects())
 PUBLIC_PROXY = False
-PROXY_WORKERS = 4
+PROXY_WORKERS = 16
 
 
 class PackageMismatch(ValueError):
@@ -57,8 +57,12 @@ def open_url(url, proxy):
 
 @lru_cache(maxsize=1)
 def proxy_candidates():
-    from public_proxy import find_proxies
-    return find_proxies()
+    from public_proxy import candidates, find_proxies
+    verified = find_proxies()
+    # Catalog probes identify working CONNECT routes, but a large package can
+    # expose different throughput and timeout behavior. Race all candidates
+    # while putting verified routes first.
+    return list(dict.fromkeys(verified + candidates()))
 
 
 def race_proxies(transfer, proxies):
