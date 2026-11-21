@@ -56,53 +56,44 @@ def wait_for_form():
 
 
 def fill_and_submit(credentials):
+    payload = json.dumps([
+        credentials["VPN_HOST"], credentials["VPN_ACCOUNT"], credentials["VPN_PASSWD"],
+    ])
+    # TopSAP binds the button after loading the page. Its startup config reply
+    # clears the form fields before populating the client version label.
+    expression = """(() => {
+        const address = document.getElementById('addr');
+        const username = document.getElementById('name_1');
+        const passwordInput = document.getElementById('pwd_1');
+        const submit = document.getElementById('submitLogin');
+        const version = document.getElementById('showVersion');
+        if (!address || !username || !passwordInput || !submit || submit.disabled ||
+            typeof login !== 'object' || typeof getCookie !== 'function' ||
+            !getCookie('keepClientSystemConfig') ||
+            document.getElementById('page_init')?.classList.contains('in') ||
+            !version?.textContent.trim() ||
+            !window.jQuery?._data?.(submit, 'events')?.click?.length) return false;
+
+        const [host, account, password] = """ + payload + """;
+        address.value = host;
+        login.from_connect_flag = 0;
+        username.value = account;
+        passwordInput.value = password;
+        document.getElementById('remember_pwd')?.setAttribute('data-value', 'off');
+        document.getElementById('auto_login')?.setAttribute('data-value', 'off');
+        submit.click();
+        return true;
+    })()"""
     target = wait_for_form()
     ws = websocket.create_connection(
         target["webSocketDebuggerUrl"], timeout=10, suppress_origin=True
     )
     try:
         for attempt in range(90):
-            ready = evaluate(
-                ws,
-                "Boolean(document.getElementById('addr') && "
-                "document.getElementById('name_1') && "
-                "document.getElementById('pwd_1') && "
-                "document.getElementById('submitLogin') && "
-                "typeof login === 'object' && "
-                "typeof getCookie === 'function' && "
-                "getCookie('keepClientSystemConfig') && "
-                "!document.getElementById('page_init').classList.contains('in'))",
-                command_id=attempt + 1,
-            )
-            if ready:
-                break
+            if evaluate(ws, expression, command_id=attempt + 1):
+                return
             time.sleep(1)
-        else:
-            raise TimeoutError("TopSAP login form did not initialize")
-
-        payload = json.dumps(
-            [
-                credentials["VPN_HOST"],
-                credentials["VPN_ACCOUNT"],
-                credentials["VPN_PASSWD"],
-            ],
-            ensure_ascii=True,
-        )
-        expression = (
-            "(() => { const [host, account, password] = "
-            + payload
-            + "; document.getElementById('addr').value = host; "
-            + "login.from_connect_flag = 0; "
-            + "document.getElementById('name_1').value = account; "
-            + "document.getElementById('pwd_1').value = password; "
-            + "const remember = document.getElementById('remember_pwd'); "
-            + "if (remember) remember.setAttribute('data-value', 'off'); "
-            + "const auto = document.getElementById('auto_login'); "
-            + "if (auto) auto.setAttribute('data-value', 'off'); "
-            + "document.getElementById('submitLogin').click(); return true; })()"
-        )
-        if not evaluate(ws, expression, command_id=100):
-            raise RuntimeError("TopSAP refused to submit login")
+        raise TimeoutError("TopSAP login controls or backend initialization did not become ready")
     finally:
         ws.close()
 
@@ -185,7 +176,7 @@ def wait_for_tunnel(timeout=900, otp_config=None):
 def main():
     credentials = read_credentials()
     otp_config = load_config(credentials)
-    print("Filling the TopSAP login form and submitting the supplied credentials.", flush=True)
+    print("Waiting for the TopSAP login form and backend to initialize.", flush=True)
     fill_and_submit(credentials)
     print("Login submitted; waiting for an active VPN tunnel.", flush=True)
     tunnel = wait_for_tunnel(timeout=settings()['LOGIN_TIMEOUT'], otp_config=otp_config)
