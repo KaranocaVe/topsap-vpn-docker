@@ -1,0 +1,8 @@
+services:
+  socks-tls-0: {}
+  socks-tls-1:
+    secrets:
+      - source: socks_tls_cert
+        target: socks-tls.crt
+      - source: socks_tls_key
+        target: socks-tls.key

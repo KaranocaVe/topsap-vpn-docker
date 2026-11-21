@@ -221,7 +221,11 @@ def main():
         pathlib.Path(name).mkdir(parents=True, exist_ok=True)
     config = settings()
     if config.get('SOCKS_TLS', '0') == '1':
-        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(TLS_CERT, TLS_KEY)
+        for path in (TLS_CERT, TLS_KEY):
+            if not path.is_file():
+                log(f'Missing SOCKS TLS secret: {path}. Check the Compose TLS mounts.')
+                return 1
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(TLS_CERT, TLS_KEY, password='')
     # Docker Desktop bind-file modes alone do not enforce Linux UID isolation.
     # The parent is native tmpfs, so traversal is enforceably root-only.
     pathlib.Path('/run/secrets').chmod(0o700)
@@ -265,7 +269,7 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, stopping)
     signal.signal(signal.SIGINT, stopping)
     try:
-        main()
+        sys.exit(main())
     except Exception as error:
         log(f'Service initialization failed ({type(error).__name__}).')
         sys.exit(1)

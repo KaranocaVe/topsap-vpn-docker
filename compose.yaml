@@ -1,6 +1,9 @@
 name: topsap-vpn
 services:
   vpn:
+    extends:
+      file: compose.socks.yaml
+      service: socks-tls-${SOCKS_TLS:-0}
     image: ${TOPSAP_IMAGE:-ghcr.io/karanocave/topsap-vpn-docker:latest}
     build: .
     init: true
@@ -48,3 +51,7 @@ services:
 secrets:
   settings:
     file: .env
+  socks_tls_cert:
+    file: ${SOCKS_TLS_CERT_FILE:-./runtime/tls/server.crt}
+  socks_tls_key:
+    file: ${SOCKS_TLS_KEY_FILE:-./runtime/tls/server.key}

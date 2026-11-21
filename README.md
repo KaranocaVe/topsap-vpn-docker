@@ -120,7 +120,7 @@ SOCKS_TLS=1
 SOCKS_TLS_SERVER_NAME='proxy.example.com'
 ```
 
-运行 `python3 manage.py up`，并在主机和云安全组放行该 TCP 端口。管理脚本会自动合并 `compose.tls.yaml`，将证书和私钥作为只读 secret 挂载；健康检查也通过 TLS 校验证书并完成 SOCKS5 鉴权和目标连接。TLS 最低版本为 1.2。
+运行 `python3 manage.py up`，并在主机和云安全组放行该 TCP 端口。Compose 根据 `SOCKS_TLS` 选择是否挂载证书和私钥，直接运行 `docker compose up` 时也从 `.env` 读取该设置。管理脚本在启动或重建容器前检查证书和私钥是否可加载。健康检查通过 TLS 校验证书，再完成 SOCKS5 鉴权和目标连接。TLS 最低版本为 1.2。
 
 ## 管理命令
 

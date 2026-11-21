@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -42,19 +43,28 @@ def compose(values, *args, capture=False):
     # Only nonsecret deployment settings enter Compose's environment.
     env = dict(os.environ, SOCKS_PORT=str(values['SOCKS_PORT']),
                SOCKS_BIND=values['SOCKS_BIND'],
+               SOCKS_TLS=values['SOCKS_TLS'],
                TOPSAP_IMAGE=values['TOPSAP_IMAGE'])
     cmd = ['docker', 'compose', '--project-directory', str(ROOT),
            '--env-file', os.devnull, '-f', str(ROOT / 'compose.yaml')]
-    if values.get('SOCKS_TLS', '0') == '1':
+    if values['SOCKS_TLS'] == '1':
         env.update({key: values[key] for key in ('SOCKS_TLS_CERT_FILE', 'SOCKS_TLS_KEY_FILE')})
-        cmd += ['-f', str(ROOT / 'compose.tls.yaml')]
     if values.get('DEBUG_DESKTOP', '0') == '1':
         cmd += ['-f', str(ROOT / 'compose.debug.yaml')]
     return subprocess.run(cmd + list(args), env=env, check=True,
                           capture_output=capture, text=True)
 
 
-def prepare():
+def prepare(values):
+    if values['SOCKS_TLS'] == '1':
+        cert, key = (Path(values[name]) for name in ('SOCKS_TLS_CERT_FILE', 'SOCKS_TLS_KEY_FILE'))
+        for setting, path in (('SOCKS_TLS_CERT_FILE', cert), ('SOCKS_TLS_KEY_FILE', key)):
+            if not path.is_file():
+                raise ValueError(f'{setting} must point to a file: {path}')
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert, key, password='')
+        except OSError as error:
+            raise ValueError(f'Cannot load SOCKS TLS certificate and key ({cert}, {key}): {error}') from None
     runtime = ROOT / 'runtime'
     runtime.mkdir(exist_ok=True)
     # Bind just this public resolver file; the rest of the rootfs stays read-only.
@@ -90,7 +100,7 @@ def main():
     args = parser.parse_args()
     values = load()
     if args.action == 'up':
-        prepare()
+        prepare(values)
         compose(values, 'up', '-d', *(['--build'] if args.build else []))
         wait_healthy(values, args.timeout)
     elif args.action == 'build':
@@ -98,14 +108,14 @@ def main():
     elif args.action == 'pull':
         compose(values, 'pull')
     elif args.action == 'update':
-        prepare()
+        prepare(values)
         compose(values, 'pull')
         compose(values, 'up', '-d', '--no-build')
         wait_healthy(values, args.timeout)
     elif args.action == 'down':
         compose(values, 'down', '--remove-orphans')
     elif args.action == 'restart':
-        prepare()
+        prepare(values)
         compose(values, 'up', '-d', '--force-recreate')
         wait_healthy(values, args.timeout)
     elif args.action == 'status':

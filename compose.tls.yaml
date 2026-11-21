@@ -1,12 +1,6 @@
+# Compatibility for deployments that explicitly include this file with -f.
 services:
   vpn:
-    secrets:
-      - source: socks_tls_cert
-        target: socks-tls.crt
-      - source: socks_tls_key
-        target: socks-tls.key
-secrets:
-  socks_tls_cert:
-    file: ${SOCKS_TLS_CERT_FILE:-./runtime/tls/server.crt}
-  socks_tls_key:
-    file: ${SOCKS_TLS_KEY_FILE:-./runtime/tls/server.key}
+    extends:
+      file: compose.socks.yaml
+      service: socks-tls-1

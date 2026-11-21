@@ -1,5 +1,8 @@
+import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -8,6 +11,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import manage
+from tls_helpers import temporary_tls_certificates
 
 
 BASE_ENV = """VPN_HOST=vpn.example.com:443
@@ -86,6 +90,9 @@ class ManageBindTests(unittest.TestCase):
         values = {
             "SOCKS_BIND": "0.0.0.0",
             "SOCKS_PORT": 1080,
+            "SOCKS_TLS": "1",
+            "SOCKS_TLS_CERT_FILE": "/certs/server.crt",
+            "SOCKS_TLS_KEY_FILE": "/certs/server.key",
             "TOPSAP_IMAGE": "ghcr.io/example/topsap:test",
             "SOCKS_USERNAME": "alice",
             "SOCKS_PASSWORD": "secret",
@@ -103,7 +110,7 @@ class ManageBindTests(unittest.TestCase):
         for key in ("VPN_ACCOUNT", "VPN_PASSWD", "SOCKS_USERNAME", "SOCKS_PASSWORD"):
             self.assertNotIn(key, environment)
 
-    def test_compose_adds_tls_override_and_file_paths_only_when_enabled(self):
+    def test_compose_passes_tls_selection_and_file_paths(self):
         common = {
             "SOCKS_BIND": "0.0.0.0",
             "SOCKS_PORT": 1080,
@@ -119,7 +126,7 @@ class ManageBindTests(unittest.TestCase):
         plain_values = dict(common, SOCKS_TLS="0")
 
         with patch.object(manage, "ROOT", self.root), patch.dict(
-                manage.os.environ, {}, clear=True), patch.object(manage.subprocess, "run") as run:
+                manage.os.environ, {"SOCKS_TLS": "0"}, clear=True), patch.object(manage.subprocess, "run") as run:
             manage.compose(tls_values, "config")
             tls_cmd = run.call_args.args[0]
             tls_env = run.call_args.kwargs["env"]
@@ -127,12 +134,49 @@ class ManageBindTests(unittest.TestCase):
             plain_cmd = run.call_args.args[0]
             plain_env = run.call_args.kwargs["env"]
 
-        self.assertIn(str(self.root / "compose.tls.yaml"), tls_cmd)
+        self.assertEqual(tls_cmd, plain_cmd)
+        self.assertEqual(tls_env["SOCKS_TLS"], "1")
         self.assertEqual(tls_env["SOCKS_TLS_CERT_FILE"], tls_values["SOCKS_TLS_CERT_FILE"])
         self.assertEqual(tls_env["SOCKS_TLS_KEY_FILE"], tls_values["SOCKS_TLS_KEY_FILE"])
-        self.assertNotIn(str(self.root / "compose.tls.yaml"), plain_cmd)
+        self.assertEqual(plain_env["SOCKS_TLS"], "0")
         self.assertNotIn("SOCKS_TLS_CERT_FILE", plain_env)
         self.assertNotIn("SOCKS_TLS_KEY_FILE", plain_env)
+
+    def test_prepare_validates_tls_material_before_writing_runtime_files(self):
+        values = self.load_with_env("SOCKS_TLS=1\nSOCKS_TLS_SERVER_NAME=proxy.example.com\n")
+        with patch.object(manage, "ROOT", self.root), temporary_tls_certificates() as pair:
+            with self.assertRaisesRegex(ValueError, "SOCKS_TLS_CERT_FILE"):
+                manage.prepare(values)
+            self.assertFalse((self.root / "runtime").exists())
+
+            values["SOCKS_TLS_CERT_FILE"] = str(pair.cert_path)
+            values["SOCKS_TLS_KEY_FILE"] = str(pair.cert_path)
+            with self.assertRaisesRegex(ValueError, "Cannot load SOCKS TLS certificate and key"):
+                manage.prepare(values)
+            self.assertFalse((self.root / "runtime").exists())
+
+            values["SOCKS_TLS_KEY_FILE"] = str(pair.key_path)
+            manage.prepare(values)
+            self.assertTrue((self.root / "runtime/resolv.conf").is_file())
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker CLI is unavailable")
+    def test_direct_compose_selects_tls_secrets_from_dotenv(self):
+        if subprocess.run(["docker", "compose", "version"], capture_output=True).returncode:
+            self.skipTest("Docker Compose is unavailable")
+        for name in ("compose.yaml", "compose.socks.yaml"):
+            shutil.copyfile(ROOT / name, self.root / name)
+        env = {name: value for name, value in os.environ.items()
+               if not name.startswith(("COMPOSE_", "SOCKS_"))}
+        for mode, tls_targets in (("", set()), ("0", set()), ("1", {"socks-tls.crt", "socks-tls.key"})):
+            with self.subTest(mode=mode):
+                mode_setting = f"SOCKS_TLS={mode}\n" if mode else ""
+                (self.root / ".env").write_text(BASE_ENV + mode_setting)
+                result = subprocess.run(["docker", "compose", "config", "--format", "json"],
+                                        cwd=self.root, env=env, capture_output=True, text=True, check=True)
+                services = json.loads(result.stdout)["services"]
+                self.assertEqual(set(services), {"vpn"})
+                targets = {secret["target"] for secret in services["vpn"]["secrets"]}
+                self.assertEqual(targets, {"topsap.env"} | tls_targets)
 
 
 if __name__ == "__main__":
